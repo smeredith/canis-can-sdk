@@ -208,7 +208,6 @@ typedef struct {
     uint8_t tseg1;              // CAN TSEG1 - 1
     uint8_t tseg2;              // CAN TSGE2 - 1
     uint8_t sjw;                // CAN SJW - 1
-    uint8_t data_bitrate_mul;   // CAN FD data bit rate multiplier relative to nominal, currently ignored
 } can_bitrate_t;
 
 /// @brief Event types
