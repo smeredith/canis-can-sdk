@@ -395,6 +395,8 @@ uint32_t WEAK TIME_CRITICAL can_isr_callback_uref(can_uref_t uref)
 #define             OPMOD(n)        (((n) & 0xfU) << 21)
 #define             TXQEN           (1U << 20)
 #define             STEF            (1U << 19)
+#define             BRSDIS          (1U << 12)
+#define             ISOCRCEN        (1U << 5)
 #define             PXEDIS          (1U << 6)
 #define         C1NBTCFG        (0x004U)
 #define             BRP(n)          (((n) & 0xffU) << 24)
@@ -615,13 +617,15 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
         // Enable the interrupts, don't dismiss any pending ones
         enable_controller_interrupts(spi_interface, 0);
 
-        // Enable transmit queue, store in transmit event FIFO, CAN 2.0 mode
+        // Enable transmit queue, store in transmit event FIFO, and use CAN FD-capable
+        // controller mode so payloads larger than 8 bytes can be transmitted. BRSDIS keeps
+        // the whole frame at the nominal bit rate for now.
         // Select mode
         uint32_t reqop;
         switch (mode) {
             default:
             case CAN_MODE_NORMAL:
-                reqop = 6U;
+                reqop = 0U;
                 break;
             case CAN_MODE_LISTEN_ONLY:
                 reqop = 3U;
@@ -641,7 +645,7 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
         // an error. This might take some time because it has to wait for bus idle, which could
         // take up to a frame time to happen (134us at 500kbit/sec, much longer at slow bit rates)
         for (uint32_t i = 0; i < 64U; i++) {
-            write_word(spi_interface, C1CON, STEF | TXQEN | REQOP(reqop));
+            write_word(spi_interface, C1CON, STEF | TXQEN | BRSDIS | ISOCRCEN | REQOP(reqop));
             c1con = read_word_crc(spi_interface, C1CON);
             uint32_t current_mode = (c1con >> 21) & 0x7U;
             if (current_mode == reqop) {
@@ -711,11 +715,15 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             //
             //          A       = 11-bit ID A
             //          B       = 18-bit ID B
+            bool fd_frame = !frame->remote && (can_dlc_to_len(frame->dlc) > 8U);
             t[1] = (free_slot << 9) | frame->dlc;
             // The ID format for CAN IDs already matches the native CAN ID register layout
             t[0] = frame->canid.id & CAN_ID_ARBITRATION_ID;
             if (can_id_is_extended(frame->canid)) {
                 t[1] |= (1U << 4); // Also set the IDE bit
+            }
+            if (fd_frame) {
+                t[1] |= (1U << 7);
             }
             if (frame->remote) {
                 t[1] |= (1U << 5);
@@ -1008,7 +1016,8 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
     canid.id = arbitration_id | (!!ide << CAN_ID_EXT_BIT);
 
     uint8_t dlc = r[1] & 0xfU;
-    bool remote = (r[1] & (1U << 5)) != 0;
+    bool fdf = (r[1] & (1U << 7)) != 0;
+    bool remote = ((r[1] & (1U << 5)) != 0) && !fdf;
     uint8_t id_filter = (r[1] >> 11) & 0x1fU;
     uint32_t timestamp = r[2];
     // The data is pulled in little endian format into a word, and must be written to
