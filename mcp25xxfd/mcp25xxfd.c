@@ -559,8 +559,11 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
     current_mode = (c1con >> 21) & 0x7U;
 
     if (current_mode == 4U) {
-        // Set bit rate values
-        write_word(spi_interface, C1NBTCFG, BRP(brp) | TSEG1(tseg1) | TSEG2(tseg2) | SJW(sjw));
+        // Preload both nominal and data bit timing registers. FD mode remains disabled
+        // until a later step, so the C1DBTCFG value is not active yet.
+        uint32_t bit_timing = BRP(brp) | TSEG1(tseg1) | TSEG2(tseg2) | SJW(sjw);
+        write_word(spi_interface, C1NBTCFG, bit_timing);
+        write_word(spi_interface, C1DBTCFG, bit_timing);
 
         // Set timestamping counter
         // Set prescaler to /40 to count microseconds
