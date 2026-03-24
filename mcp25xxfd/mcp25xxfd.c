@@ -478,6 +478,7 @@ static void TIME_CRITICAL set_controller_pins(can_interface_t *spi_interface, bo
     write_word(spi_interface, OSC, 0);
     // Set up IOCON by setting:
     //
+    // INTOD=1 to select open-drain mode for INT
     // SOF=1 to select SOF on CLKO
     // TXCANOD=1 to select open collector transmit pin
     // PM1=1 to use pin as GPIO1
