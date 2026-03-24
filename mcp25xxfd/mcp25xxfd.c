@@ -88,10 +88,34 @@ void debug_printf( const char *format, ... );
 
 // Number of times a CRC-failed transaction will be re-tried
 #define CRC_RETRIES                         (5U)
-// Number of bytes used to store a receive event (CAN frame, error, etc.)
-#define NUM_RX_EVENT_BYTES                  (19U)
+// Number of bytes used to store receive events serialized as bytes
+#define NUM_RX_EVENT_HEADER_BYTES           (11U)
+#define NUM_RX_ERROR_EVENT_BYTES            (15U)
+#define NUM_RX_OVERFLOW_EVENT_BYTES         (15U)
+#define NUM_RX_EVENT_BYTES_MAX              (NUM_RX_EVENT_HEADER_BYTES + CAN_FRAME_MAX_DATA_LEN)
 // Number of bytes used to store a transmission event (CAN frame sent, etc.)
 #define NUM_TX_EVENT_BYTES                  (9U)
+// MCP25xxFD message RAM is 2 KB total, so 64-byte payload objects require shallower hardware queues.
+#define MCP25XXFD_RAM_BYTES                 (2048U)
+#define MCP25XXFD_HW_TEF_DEPTH              (4U)
+#define MCP25XXFD_HW_TXQ_DEPTH              (4U)
+#define MCP25XXFD_HW_RX_FIFO_DEPTH          (22U)
+#define MCP25XXFD_HW_PAYLOAD_CODE           (0x7U)       // 64-byte payload objects
+#define MCP25XXFD_TEF_OBJ_BYTES             (12U)        // TEF timestamp enabled
+#define MCP25XXFD_TXQ_OBJ_BYTES             (8U + CAN_FRAME_MAX_DATA_LEN)
+#define MCP25XXFD_RX_FIFO_OBJ_BYTES         (12U + CAN_FRAME_MAX_DATA_LEN)
+#define MCP25XXFD_TXQ_BASE_ADDR             (MCP25XXFD_HW_TEF_DEPTH * MCP25XXFD_TEF_OBJ_BYTES)
+#define MCP25XXFD_RAM_USAGE_BYTES           ((MCP25XXFD_HW_TEF_DEPTH * MCP25XXFD_TEF_OBJ_BYTES) + \
+                                             (MCP25XXFD_HW_TXQ_DEPTH * MCP25XXFD_TXQ_OBJ_BYTES) + \
+                                             (MCP25XXFD_HW_RX_FIFO_DEPTH * MCP25XXFD_RX_FIFO_OBJ_BYTES))
+
+#if (MCP25XXFD_RAM_USAGE_BYTES > MCP25XXFD_RAM_BYTES)
+#error "MCP25xxFD message RAM allocation exceeds 2 KB"
+#endif
+
+#if (CAN_TX_QUEUE_SIZE < MCP25XXFD_HW_TXQ_DEPTH)
+#error "CAN_TX_QUEUE_SIZE must be >= MCP25XXFD_HW_TXQ_DEPTH"
+#endif
 
 // Write a 32-bit word in big endian format to a buffer
 #define WRITE_BIG_ENDIAN(buf, word)         ((buf)[0] = (uint8_t)(((word) >> 24) & 0xffU),  \
@@ -138,28 +162,25 @@ static void TIME_CRITICAL write_byte(can_interface_t *spi_interface, uint32_t ad
     mcp25xxfd_spi_deselect(spi_interface);
 }
 
-static void TIME_CRITICAL write_4words(can_interface_t *spi_interface, uint16_t addr, const uint32_t words[])
+static void TIME_CRITICAL write_words(can_interface_t *spi_interface, uint16_t addr, const uint32_t words[], uint32_t n)
 {
     // Must be called with interrupts locked
 
-    // Prepare a contiguous buffer for the command because the SPI hardware is pipelined and do not want to stop
-    // to switch buffers
-    uint8_t cmd[18];
-    // MCP251xFD SPI transaction = command/addr, 4 bytes
+    // Send the command first, then stream words in little-endian order.
+    uint8_t cmd[2];
     cmd[0] = 0x20 | ((addr >> 8U) & 0xfU);
     cmd[1] = addr & 0xffU;
 
-    uint32_t i = 2U;
-    for (uint32_t j = 0; j < 4U; j++) {
-        cmd[i++] = words[j] & 0xffU;
-        cmd[i++] = (words[j] >> 8) & 0xffU;
-        cmd[i++] = (words[j] >> 16) & 0xffU;
-        cmd[i++] = (words[j] >> 24) & 0xffU;
-    }
-
-    // SPI transaction
     mcp25xxfd_spi_select(spi_interface);
     mcp25xxfd_spi_write(spi_interface, cmd, sizeof(cmd));
+    for (uint32_t j = 0; j < n; j++) {
+        uint8_t buf[4];
+        buf[0] = words[j] & 0xffU;
+        buf[1] = (words[j] >> 8) & 0xffU;
+        buf[2] = (words[j] >> 16) & 0xffU;
+        buf[3] = (words[j] >> 24) & 0xffU;
+        mcp25xxfd_spi_write(spi_interface, buf, sizeof(buf));
+    }
     mcp25xxfd_spi_deselect(spi_interface);
 }
 
@@ -456,6 +477,10 @@ uint32_t WEAK TIME_CRITICAL can_isr_callback_uref(can_uref_t uref)
 #define         C1FLTOBJ(n)     (((n) * 8U) + 0x1f0U)
 #define         C1MASK(n)       (((n) * 8U) + 0x1f4U)
 
+#define MCP25XXFD_TEFCON_CONFIG            (FSIZE(MCP25XXFD_HW_TEF_DEPTH - 1U) | TEFTSEN | TEFNEIE)
+#define MCP25XXFD_TXQCON_CONFIG            (PLSIZE(MCP25XXFD_HW_PAYLOAD_CODE) | FSIZE(MCP25XXFD_HW_TXQ_DEPTH - 1U) | TXAT(0x3U))
+#define MCP25XXFD_RXFIFOCON1_CONFIG        (PLSIZE(MCP25XXFD_HW_PAYLOAD_CODE) | FSIZE(MCP25XXFD_HW_RX_FIFO_DEPTH - 1U) | RXTSEN | TFNRFNIE)
+
 // Hard reset of the MCP251xFD using a special SPI command
 static void TIME_CRITICAL hard_reset(can_interface_t *spi_interface)
 {
@@ -571,21 +596,21 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
         write_word(spi_interface, C1TSCON, TBCEN | TBCPRE(39U));
 
         // Transmit event FIFO control register
-        // FSIZE 32-deep
+        // Reduced depth to keep room in message RAM for 64-byte RX/TX objects.
         // TEFTSEN Timestamp transmissions
         // TEFNEIIE not empty interrupt enable
-        write_word(spi_interface, C1TEFCON, FSIZE(0x1fU) | TEFTSEN | TEFNEIE);
+        write_word(spi_interface, C1TEFCON, MCP25XXFD_TEFCON_CONFIG);
 
         // Transmit queue control register
-        // FSIZE 32-deep
+        // Reduced depth to bias message RAM toward the receive FIFO.
         // TXAT Unlimited retransmissions (this field isn't active but set it anyway)
-        write_word(spi_interface, C1TXQCON, FSIZE(0x1fU) | TXAT(0x3U));
+        write_word(spi_interface, C1TXQCON, MCP25XXFD_TXQCON_CONFIG);
 
         // FIFO 1 is the receive FIFO
-        // FSIZE 32-deep
+        // Sized as large as will fit with 64-byte message objects and the smaller TEF/TXQ above.
         // RXTSEN Timestamp receptions
         // TFNRFNIE interrupts enabled
-        write_word(spi_interface, C1FIFOCON1, FSIZE(0x1fU) | RXTSEN | TFNRFNIE);
+        write_word(spi_interface, C1FIFOCON1, MCP25XXFD_RXFIFOCON1_CONFIG);
 
         // Enable the interrupts, don't dismiss any pending ones
         enable_controller_interrupts(spi_interface, 0);
@@ -662,19 +687,21 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             // such corruption has been seen and so we use a CRC-protected read.
             uint16_t c1txqua = (uint16_t)read_word_crc(spi_interface, C1TXQUA);
             uint16_t addr = c1txqua + 0x400U;
-            // (Transmit event slots start at an offset of 0 (a total of 3 x 4 bytes x 32 slots = 384 bytes)
-            // Transmit queue slots start at an offset 0x180, and each is 16 bytes (we allocated 16 bytes to the
-            // data even though handling only CAN frames, meaning the whole buffer slot is 16 bytes)
-            uint32_t free_slot = (c1txqua - 0x180U) >> 4;
+            // The TXQ starts immediately after the TEF allocation in message RAM.
+            if ((c1txqua < MCP25XXFD_TXQ_BASE_ADDR) || (((c1txqua - MCP25XXFD_TXQ_BASE_ADDR) % MCP25XXFD_TXQ_OBJ_BYTES) != 0U)) {
+                controller->target_specific.txqua_bad++;
+                return false;
+            }
+            uint32_t free_slot = (c1txqua - MCP25XXFD_TXQ_BASE_ADDR) / MCP25XXFD_TXQ_OBJ_BYTES;
 
             ////// Error checking: should not happen if the hardware is behaving correctly
-            if (free_slot >= CAN_TX_QUEUE_SIZE) {
+            if (free_slot >= MCP25XXFD_HW_TXQ_DEPTH) {
                 controller->target_specific.txqua_bad++;
                 return false;
             }
             // Copy the frame into the message slot in the controller
             // Layout of TXQ message object:
-            uint32_t t[4];
+            uint32_t t[2U + CAN_FRAME_MAX_DATA_WORDS];
             
             // CAN ID in the controller is in the following format:
             //          31       23       15       7
@@ -693,12 +720,10 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             if (frame->remote) {
                 t[1] |= (1U << 5);
             }
-            // These words together represent a block of 8 bytes, data byte 0 at the lowest address,
-            // data in the controller is in little endian format that matches this. If the host is
-            // a big endian CPU then the word must be flipped to little endian first.
-
-            t[2] = mcp25xxfd_convert_bytes(frame->data[0]);
-            t[3] = mcp25xxfd_convert_bytes(frame->data[1]);
+            // Data words are laid out little-endian in message RAM. The payload area is fixed at 64 bytes.
+            for (uint32_t i = 0; i < CAN_FRAME_MAX_DATA_WORDS; i++) {
+                t[2U + i] = mcp25xxfd_convert_bytes(frame->data[i]);
+            }
 
             // Mark slot and update next free slot
             if (fifo) {
@@ -714,12 +739,12 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
 
             // TODO could use a DMA channel and chain these SPI transactions using DMA
             // Write this block over SPI
-            write_4words(spi_interface, addr, t);
+            write_words(spi_interface, addr, t, 2U + CAN_FRAME_MAX_DATA_WORDS);
 
             // Now tell the controller to take the frame and move C1TXQUA
             // Set UINC=1, TXREQ=1
             // Transmit queue control register
-            write_word(spi_interface, C1TXQCON, UINC | TXREQ);
+            write_word(spi_interface, C1TXQCON, MCP25XXFD_TXQCON_CONFIG | UINC | TXREQ);
 
             return true;
         }
@@ -758,8 +783,8 @@ static void TIME_CRITICAL init_tx_buffers(can_controller_t *controller)
         controller->tx_pri_queue.uref[i] = can_uref_null;
         controller->tx_pri_queue.uref_valid[i] = false;
     }
-    controller->tx_pri_queue.num_free_slots = CAN_TX_QUEUE_SIZE;
-    controller->tx_pri_queue.fifo_slot = CAN_TX_FIFO_SIZE;
+    controller->tx_pri_queue.num_free_slots = MCP25XXFD_HW_TXQ_DEPTH;
+    controller->tx_pri_queue.fifo_slot = CAN_TX_QUEUE_SIZE;
 }
 
 // At present there is a single CAN controller on the board so there is no need to work out which
@@ -787,7 +812,7 @@ static void TIME_CRITICAL tx_handler(can_controller_t *controller)
     // The sequence number may have been corrupted over SPI by noise so we treat it with some
     // suspicion. If it doesn't refer to a valid slot then we dismiss the interrupt without
     // processing it.
-    if (seq > CAN_TX_QUEUE_SIZE || !controller->tx_pri_queue.uref_valid[seq]) {
+    if (seq >= CAN_TX_QUEUE_SIZE || !controller->tx_pri_queue.uref_valid[seq]) {
         // Bad SEQ value, keep a count of it and then dismiss the interrupt. This will result
         // in the transmit buffer slot not being cleared, so slowly the buffer will run out of
         // space. But the CRC-protected read should not permit this to fail (it returns 0xffffffffU
@@ -800,7 +825,7 @@ static void TIME_CRITICAL tx_handler(can_controller_t *controller)
 
         // Remove frame from the transmit queue
         if (fifo) {
-            controller->tx_pri_queue.fifo_slot = CAN_TX_FIFO_SIZE;
+            controller->tx_pri_queue.fifo_slot = CAN_TX_QUEUE_SIZE;
         }
         can_uref_t uref = controller->tx_pri_queue.uref[seq];
         // The user-reference as no longer valid
@@ -871,7 +896,7 @@ static void TIME_CRITICAL tx_handler(can_controller_t *controller)
     // MCP251xFD interrupts are level-sensitive so GPIO must be set to level sensitive; interrupt
     // will be re-raised if still not empty when serviced.
     // Set FSIZE, UINC, TEFTSEN, TEFNEIE
-    write_word(spi_interface, C1TEFCON, FSIZE(0x1fU) | UINC | TEFTSEN | TEFNEIE);
+    write_word(spi_interface, C1TEFCON, MCP25XXFD_TEFCON_CONFIG | UINC);
 }
 
 // Errata: C1TREC read can be corrupted
@@ -961,8 +986,8 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
     uint16_t addr = (uint16_t)read_word_crc(spi_interface, C1FIFOUA1) + 0x400U;
 
     // Pick up the frame
-    uint32_t r[5];
-    read_words(spi_interface, addr, r, 5U);
+    uint32_t r[3U + CAN_FRAME_MAX_DATA_WORDS];
+    read_words(spi_interface, addr, r, 3U + CAN_FRAME_MAX_DATA_WORDS);
 
     // Get to the receive callback as quickly as possible
 
@@ -989,22 +1014,21 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
     // The data is pulled in little endian format into a word, and must be written to
     // memory in little endian format with the lowest address byte set to bits 7:0 of
     // the word.
-    uint32_t data_0 = mcp25xxfd_convert_bytes(r[3]);
-    uint32_t data_1 = mcp25xxfd_convert_bytes(r[4]);
-
-    can_frame_t frame = {.canid = canid,
+    can_frame_t frame = {.uref = can_uref_null,
+                         .canid = canid,
                          .dlc = dlc,
                          .remote = remote,
-                         .data[0] = data_0,
-                         .data[1] = data_1,
                          .id_filter = id_filter};
+    for (uint32_t i = 0; i < CAN_FRAME_MAX_DATA_WORDS; i++) {
+        frame.data[i] = mcp25xxfd_convert_bytes(r[3U + i]);
+    }
 
     // Callback is a good place to put any CAN ID or payload triggering function
     can_isr_callback_frame_rx(&frame, timestamp);
 
     // Mark the frame as taken, ensure that timestamping and the not-empty interrupt are still enabled
     // Set UINC, RXTSEN, TFNRFNIE. This will dismiss the interrupt level (if there are no other interrupts)
-    write_word(spi_interface, C1FIFOCON1, UINC | RXTSEN | TFNRFNIE);
+    write_word(spi_interface, C1FIFOCON1, MCP25XXFD_RXFIFOCON1_CONFIG | UINC);
 
     bool ignore_overflow = controller->options & CAN_OPTION_REJECT_OVERFLOW;
     bool ignore_remote = controller->options & CAN_OPTION_REJECT_REMOTE;
@@ -1089,6 +1113,19 @@ static void TIME_CRITICAL pop_rx_event(can_controller_t *controller, can_rx_even
     *dest = controller->rx_fifo.rx_events[idx];
 }
 
+static size_t rx_event_num_bytes(const can_rx_event_t *event)
+{
+    switch (event->event_type) {
+        case CAN_EVENT_TYPE_RECEIVED_FRAME:
+            return NUM_RX_EVENT_HEADER_BYTES + can_frame_get_data_len(&event->event.frame);
+        case CAN_EVENT_TYPE_CAN_ERROR:
+            return NUM_RX_ERROR_EVENT_BYTES;
+        case CAN_EVENT_TYPE_OVERFLOW:
+        default:
+            return NUM_RX_OVERFLOW_EVENT_BYTES;
+    }
+}
+
 // Pop an event from the receive event FIFO and convert it into bytes
 static void TIME_CRITICAL pop_rx_event_as_bytes(can_controller_t *controller, uint8_t *buf)
 {
@@ -1124,7 +1161,8 @@ static void TIME_CRITICAL pop_rx_event_as_bytes(can_controller_t *controller, ui
         buf[5] = controller->rx_fifo.rx_events[idx].event.frame.dlc;
         buf[6] = controller->rx_fifo.rx_events[idx].event.frame.id_filter;
         WRITE_BIG_ENDIAN(buf + 7U, controller->rx_fifo.rx_events[idx].event.frame.canid.id);
-        for (size_t i = 0; i < 8U; i++) {
+        size_t data_len = can_frame_get_data_len(&controller->rx_fifo.rx_events[idx].event.frame);
+        for (size_t i = 0; i < data_len; i++) {
             buf[11U + i] = *((uint8_t *) (controller->rx_fifo.rx_events[idx].event.frame.data) + i);
         }
     }
@@ -1561,17 +1599,20 @@ uint32_t TIME_CRITICAL can_recv_as_bytes(can_controller_t *controller, uint8_t *
         // If the controller has not been initialized then return no bytes
         return 0;
     }
-    if (n_bytes < NUM_RX_EVENT_BYTES) {
-        return 0;
-    }
-
     can_interface_t *spi_interface = &controller->host_interface;
 
     uint32_t result;
     mcp25xxfd_spi_gpio_disable_irq(spi_interface);
     if (CAN_RX_FIFO_SIZE - controller->rx_fifo.free) {
-        pop_rx_event_as_bytes(controller, dest);
-        result = NUM_RX_EVENT_BYTES;
+        can_rx_event_t *event = &controller->rx_fifo.rx_events[controller->rx_fifo.head_idx];
+        size_t event_bytes = rx_event_num_bytes(event);
+        if (n_bytes >= event_bytes) {
+            pop_rx_event_as_bytes(controller, dest);
+            result = event_bytes;
+        }
+        else {
+            result = 0;
+        }
     }
     else {
         result = 0;

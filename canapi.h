@@ -81,6 +81,9 @@
 #error "CAN_TX_EVENT_FIFO_SIZE must be < 256"
 #endif
 
+#define CAN_FRAME_MAX_DATA_LEN            (64U)
+#define CAN_FRAME_MAX_DATA_WORDS          (CAN_FRAME_MAX_DATA_LEN / sizeof(uint32_t))
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////// DATA STRUCTURES /////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -262,7 +265,7 @@ static uint8_t can_status_get_rec(can_status_t status);
 typedef struct  {
     can_uref_t uref;    // User-defined data for callbacks to use
     can_id_t canid;     // CAN ID
-    uint32_t data[2];   // Payload stored as two words (but in memory treated as bytes)
+    uint32_t data[CAN_FRAME_MAX_DATA_WORDS]; // Payload stored as words (but in memory treated as bytes)
     uint8_t dlc;        // DLC (0-15)
     uint8_t id_filter;  // Filter hit: index of ID filter that accepted the frame (received only)
     bool remote;        // Frame is remote
@@ -428,15 +431,67 @@ INLINE uint8_t *can_frame_get_data(const can_frame_t *frame)
     return (uint8_t *)frame->data;
 }
 
+/// @brief Converts a CAN DLC value to a payload length in bytes
+INLINE size_t can_dlc_to_len(uint8_t dlc)
+{
+    dlc &= 0xfU;
+    if (dlc <= 8U) {
+        return dlc;
+    }
+
+    switch (dlc) {
+        case 9U:
+            return 12U;
+        case 10U:
+            return 16U;
+        case 11U:
+            return 20U;
+        case 12U:
+            return 24U;
+        case 13U:
+            return 32U;
+        case 14U:
+            return 48U;
+        default:
+            return 64U;
+    }
+}
+
+/// @brief Converts a payload length in bytes to a CAN DLC value
+INLINE uint8_t can_len_to_dlc(size_t len)
+{
+    if (len <= 8U) {
+        return (uint8_t)len;
+    }
+    if (len <= 12U) {
+        return 9U;
+    }
+    if (len <= 16U) {
+        return 10U;
+    }
+    if (len <= 20U) {
+        return 11U;
+    }
+    if (len <= 24U) {
+        return 12U;
+    }
+    if (len <= 32U) {
+        return 13U;
+    }
+    if (len <= 48U) {
+        return 14U;
+    }
+    return 15U;
+}
+
 /// @brief Returns the number of bytes in the payload
 INLINE size_t can_frame_get_data_len(const can_frame_t *frame)
 {
-    uint8_t len = (frame->dlc & 0x8U) ? 8U : frame->dlc;
     if (can_frame_is_remote(frame)) {
         return 0;
     }
     else {
-        return len;
+        return can_dlc_to_len(frame->dlc);
     }
 }
 
@@ -476,6 +531,7 @@ INLINE void can_make_frame(can_frame_t *frame, bool ide, uint32_t arbitration_id
 {
     // Limit the DLC to 4 bits in case the caller has made an error
     dlc &= 0xfU;
+    size_t data_len = can_dlc_to_len(dlc);
 
     // Fill out the frame details
     frame->canid = can_make_id(ide, arbitration_id);
@@ -483,39 +539,14 @@ INLINE void can_make_frame(can_frame_t *frame, bool ide, uint32_t arbitration_id
     frame->remote = remote;
     frame->id_filter = 0;
     frame->uref = can_uref_null;    // User can fill this in later if necessary
-    // Copy the correct number of data bytes in
     uint8_t *dst = (uint8_t *)frame->data;
-    switch(dlc) {
-        // Fallthrough case statement to copy a CAN data from a block of bytes
-        // The source for this may not be word-aligned and memory beyond the specified
-        // number of bytes may not be accessible, so copy exactly the number of bytes.
-        // Because this is inline, the compiler may make a much better job of copying
-        // in cases where a word copy will do.
-        case 15U:
-        case 14U:
-        case 13U:
-        case 12U:
-        case 11U:
-        case 10U:
-        case 9U:
-        case 8U:
-            dst[7] = data[7];
-        case 7U:
-            dst[6] = data[6];
-        case 6U:
-            dst[5] = data[5];
-        case 5U:
-            dst[4] = data[4];
-        case 4U:
-            dst[3] = data[3];
-        case 3U:
-            dst[2] = data[2];
-        case 2U:
-            dst[1] = data[1];
-        case 1U:
-            dst[0] = data[0];
-        default:
-            break;
+    for (size_t i = 0; i < CAN_FRAME_MAX_DATA_LEN; i++) {
+        if ((data != NULL) && (i < data_len)) {
+            dst[i] = data[i];
+        }
+        else {
+            dst[i] = 0U;
+        }
     }
 }
 
@@ -570,15 +601,10 @@ INLINE void can_make_bytes_from_frame(uint8_t *dest, const can_frame_t *frame, u
     CAN_WRITE_BIG_ENDIAN_WORD(dest + 7U, can_id_word);
 
     uint8_t *data = can_frame_get_data(frame);
-    // Copy the block of data over (unused bytes are copied too)
-    dest[11] = data[0];
-    dest[12] = data[1];
-    dest[13] = data[2];
-    dest[14] = data[3];
-    dest[15] = data[4];
-    dest[16] = data[5];
-    dest[17] = data[6];
-    dest[18] = data[7];
+    size_t data_len = can_frame_get_data_len(frame);
+    for (size_t i = 0; i < data_len; i++) {
+        dest[11U + i] = data[i];
+    }
 }
 
 /////////////////////////////////////// CAN receive overflow ///////////////////////////////////////
