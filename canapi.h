@@ -402,6 +402,20 @@ void can_status_request_recover(can_controller_t *controller);
 /// @param fifo If true, puts the frame into the FIFO queue that feeds into the priority queue
 can_errorcode_t can_send_frame(can_controller_t *controller, const can_frame_t *frame, bool fifo);
 
+/// @brief Split a byte buffer into exact CAN/CAN FD payload sizes and queue the resulting frames
+/// @param ide True if the arbitration ID is 29-bit
+/// @param arbitration_id The 29-bit or 11-bit CAN ID to use for all frames
+/// @param data Pointer to the byte buffer to send
+/// @param len Number of bytes to send
+/// @param fifo If true, puts the frames into the FIFO queue that feeds into the priority queue
+/// @returns CAN_ERC_NO_ERROR on success, otherwise a queueing or initialization error
+can_errorcode_t can_send_buffer(can_controller_t *controller,
+                                bool ide,
+                                uint32_t arbitration_id,
+                                const uint8_t *data,
+                                size_t len,
+                                bool fifo);
+
 /// @brief Returns true if there is space to send a number of frames
 /// @param n_frames The number of frames to send
 /// @param fifo If the frames are to go into the FIFO queue

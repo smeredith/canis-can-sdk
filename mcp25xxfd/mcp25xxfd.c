@@ -775,6 +775,19 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
     }
 }
 
+INLINE uint8_t can_buffer_chunk_len(size_t available)
+{
+    if (available >= 64U) return 64U;
+    if (available >= 48U) return 48U;
+    if (available >= 32U) return 32U;
+    if (available >= 24U) return 24U;
+    if (available >= 20U) return 20U;
+    if (available >= 16U) return 16U;
+    if (available >= 12U) return 12U;
+    if (available >= 8U) return 8U;
+    return (uint8_t)available;
+}
+
 // Erase all transmit buffers (called by initialization and also as a response
 // to bus-off since those frames will have been erased from the controller by
 // the automatic bus-off recovery)
@@ -1599,6 +1612,55 @@ can_errorcode_t TIME_CRITICAL can_send_frame(can_controller_t *controller, const
     mcp25xxfd_spi_gpio_enable_irq(spi_interface);
 
     return queued ? CAN_ERC_NO_ERROR : CAN_ERC_NO_ROOM;
+}
+
+can_errorcode_t TIME_CRITICAL can_send_buffer(can_controller_t *controller,
+                                              bool ide,
+                                              uint32_t arbitration_id,
+                                              const uint8_t *data,
+                                              size_t len,
+                                              bool fifo)
+{
+    if (controller == NULL) {
+        return CAN_ERC_BAD_INIT;
+    }
+    if ((len > 0U) && (data == NULL)) {
+        return CAN_ERC_RANGE;
+    }
+    if (len == 0U) {
+        return CAN_ERC_NO_ERROR;
+    }
+
+    uint32_t n_frames = 0U;
+    size_t remaining = len;
+    while (remaining > 0U) {
+        remaining -= can_buffer_chunk_len(remaining);
+        n_frames++;
+    }
+
+    if (!can_is_space(controller, n_frames, fifo)) {
+        return fifo ? CAN_ERC_NO_ROOM_FIFO : CAN_ERC_NO_ROOM_PRIORITY;
+    }
+
+    can_interface_t *spi_interface = &controller->host_interface;
+    mcp25xxfd_spi_gpio_disable_irq(spi_interface);
+
+    const uint8_t *src = data;
+    remaining = len;
+    while (remaining > 0U) {
+        uint8_t chunk_len = can_buffer_chunk_len(remaining);
+        can_frame_t frame;
+        can_make_frame(&frame, ide, arbitration_id, can_len_to_dlc(chunk_len), src, false);
+        if (!send_frame(controller, &frame, fifo)) {
+            mcp25xxfd_spi_gpio_enable_irq(spi_interface);
+            return CAN_ERC_NO_ROOM;
+        }
+        src += chunk_len;
+        remaining -= chunk_len;
+    }
+
+    mcp25xxfd_spi_gpio_enable_irq(spi_interface);
+    return CAN_ERC_NO_ERROR;
 }
 
 uint32_t TIME_CRITICAL can_recv_as_bytes(can_controller_t *controller, uint8_t *dest, size_t n_bytes)
