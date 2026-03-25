@@ -1081,6 +1081,7 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
 
     uint8_t dlc = r[1] & 0xfU;
     bool fdf = (r[1] & (1U << 7)) != 0;
+    bool brs = (r[1] & (1U << 6)) != 0;
     bool remote = ((r[1] & (1U << 5)) != 0) && !fdf;
     uint8_t id_filter = (r[1] >> 11) & 0x1fU;
     uint32_t timestamp = r[2];
@@ -1091,6 +1092,7 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
                          .canid = canid,
                          .dlc = dlc,
                          .remote = remote,
+                         .format = fdf ? (brs ? CAN_FRAME_FORMAT_FD_BRS : CAN_FRAME_FORMAT_FD) : CAN_FRAME_FORMAT_CLASSIC,
                          .id_filter = id_filter};
     for (uint32_t i = 0; i < CAN_FRAME_MAX_DATA_WORDS; i++) {
         frame.data[i] = mcp25xxfd_convert_bytes(r[3U + i]);
@@ -1228,8 +1230,10 @@ static void TIME_CRITICAL pop_rx_event_as_bytes(can_controller_t *controller, ui
     }
     else if (ev == CAN_EVENT_TYPE_RECEIVED_FRAME) {
         // Pack out the rest of the bytes with the frame details
-        // Add flag info to indicate a remote frame
+        // Add flag info to indicate remote / FD / BRS frame properties.
         buf[0] |= controller->rx_fifo.rx_events[idx].event.frame.remote ? 0x80U : 0x00U;
+        buf[0] |= can_frame_is_fd(&controller->rx_fifo.rx_events[idx].event.frame) ? 0x40U : 0x00U;
+        buf[0] |= can_frame_uses_bitrate_switch(&controller->rx_fifo.rx_events[idx].event.frame) ? 0x20U : 0x00U;
         // DLC, ID filter hit, timestamp, CAN ID, data
         buf[5] = controller->rx_fifo.rx_events[idx].event.frame.dlc;
         buf[6] = controller->rx_fifo.rx_events[idx].event.frame.id_filter;

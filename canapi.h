@@ -270,12 +270,20 @@ static uint8_t can_status_get_tec(can_status_t status);
 static uint8_t can_status_get_rec(can_status_t status);
 
 /// @brief Structure holding the details of a CAN frame
+typedef enum {
+    CAN_FRAME_FORMAT_CLASSIC = 0,   // Classic CAN 2.0 frame
+    CAN_FRAME_FORMAT_FD = 1,        // CAN FD frame without bitrate switching
+    CAN_FRAME_FORMAT_FD_BRS = 2,    // CAN FD frame with bitrate switching
+} can_frame_format_t;
+
+/// @brief Structure holding the details of a CAN frame
 typedef struct  {
     can_uref_t uref;    // User-defined data for callbacks to use
     can_id_t canid;     // CAN ID
     uint32_t data[CAN_FRAME_MAX_DATA_WORDS]; // Payload stored as words (but in memory treated as bytes)
     uint8_t dlc;        // DLC (0-15)
     uint8_t id_filter;  // Filter hit: index of ID filter that accepted the frame (received only)
+    uint8_t format;     // can_frame_format_t
     bool remote;        // Frame is remote
 } can_frame_t;
 
@@ -442,6 +450,24 @@ INLINE bool can_frame_is_remote(const can_frame_t *frame)
     return frame->remote;
 }
 
+/// @brief Returns the frame format
+INLINE can_frame_format_t can_frame_get_format(const can_frame_t *frame)
+{
+    return (can_frame_format_t)frame->format;
+}
+
+/// @brief Returns true if the frame is a CAN FD frame
+INLINE bool can_frame_is_fd(const can_frame_t *frame)
+{
+    return can_frame_get_format(frame) != CAN_FRAME_FORMAT_CLASSIC;
+}
+
+/// @brief Returns true if the frame uses bitrate switching
+INLINE bool can_frame_uses_bitrate_switch(const can_frame_t *frame)
+{
+    return can_frame_get_format(frame) == CAN_FRAME_FORMAT_FD_BRS;
+}
+
 /// @brief Returns the arbitration ID of the frame
 INLINE uint32_t can_frame_get_arbitration_id(const can_frame_t *frame)
 {
@@ -561,6 +587,7 @@ INLINE void can_make_frame(can_frame_t *frame, bool ide, uint32_t arbitration_id
     frame->dlc = dlc;
     frame->remote = remote;
     frame->id_filter = 0;
+    frame->format = (!remote && (data_len > 8U)) ? CAN_FRAME_FORMAT_FD : CAN_FRAME_FORMAT_CLASSIC;
     frame->uref = can_uref_null;    // User can fill this in later if necessary
     uint8_t *dst = (uint8_t *)frame->data;
     for (size_t i = 0; i < CAN_FRAME_MAX_DATA_LEN; i++) {
@@ -594,11 +621,14 @@ INLINE void can_frame_set_uref(can_frame_t *frame, void *ref)
 
 
 /// @brief Creates a frame from a block of bytes
+/// Byte 0 flag bits: 0x01 remote, 0x02 CAN FD, 0x04 bitrate switch
 /// @param frame Pointer to a frame structure allocated by the application
 /// @param src A pointer to bytes from where the frame will be created
 INLINE void can_make_frame_from_bytes(can_frame_t *frame, const uint8_t *src)
 {
     bool remote = (src[0] & 0x01U) != 0;
+    bool fd = (src[0] & 0x02U) != 0;
+    bool brs = (src[0] & 0x04U) != 0;
     uint8_t dlc = src[1] & 0x0fU;
     uint32_t tag = CAN_READ_BIG_ENDIAN_WORD(src + 3U);
     uint32_t can_id_word = CAN_READ_BIG_ENDIAN_WORD(src + 7U);
@@ -607,13 +637,28 @@ INLINE void can_make_frame_from_bytes(can_frame_t *frame, const uint8_t *src)
     const uint8_t *data = &src[11];
 
     can_make_frame(frame, ide, arbitration_id, dlc, data, remote);
+    if (!remote) {
+        if (brs) {
+            frame->format = CAN_FRAME_FORMAT_FD_BRS;
+        }
+        else if (fd || (can_dlc_to_len(dlc) > 8U)) {
+            frame->format = CAN_FRAME_FORMAT_FD;
+        }
+    }
     // The reference in the frame is the 32-bit tag stored in the frame
     can_frame_set_uref(frame, (void *)tag); 
 }
 
 INLINE void can_make_bytes_from_frame(uint8_t *dest, const can_frame_t *frame, uint32_t tag)
 {
+    // Byte 0 flag bits: 0x01 remote, 0x02 CAN FD, 0x04 bitrate switch
     dest[0] = frame->remote ? 0x1U : 0;
+    if (can_frame_is_fd(frame)) {
+        dest[0] |= 0x02U;
+    }
+    if (can_frame_uses_bitrate_switch(frame)) {
+        dest[0] |= 0x04U;
+    }
     dest[1] = frame->dlc;
     uint32_t can_id_word = can_frame_get_arbitration_id(frame);
     if (can_frame_is_extended(frame)) {
