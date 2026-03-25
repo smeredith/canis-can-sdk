@@ -185,7 +185,8 @@ typedef enum {
 
 /// @brief Standard CAN bit rate profiles
 typedef enum {
-    CAN_BITRATE_500K_75 = 0,    // 500kbit/sec 75% sample (default)    
+    CAN_BITRATE_1M_80 = 0,      // 1Mbit/sec with 80% sample point (default)
+    CAN_BITRATE_500K_75,        // 500kbit/sec 75% sample point
     CAN_BITRATE_250K_75,        // 250kbit/sec 75% sample point 
     CAN_BITRATE_125K_75,        // 125kbit/sec 75% sample point
     CAN_BITRATE_1M_75,          // 1Mbit/sec 75% sample point
@@ -214,11 +215,11 @@ typedef enum {
 /// @brief Structure holding the profile and other parameters
 typedef struct {
     can_profile_t profile;
+    can_data_bitrate_t data_bitrate; // CAN FD data-phase bitrate preset
     uint8_t brp;                // Baud rate prescaler (0 = /1)
     uint8_t tseg1;              // CAN TSEG1 - 1
     uint8_t tseg2;              // CAN TSGE2 - 1
     uint8_t sjw;                // CAN SJW - 1
-    can_data_bitrate_t data_bitrate; // CAN FD data-phase bitrate preset
 } can_bitrate_t;
 
 /// @brief Event types

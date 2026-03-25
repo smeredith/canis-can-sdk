@@ -1479,6 +1479,12 @@ can_errorcode_t can_setup_controller(can_controller_t *controller,
     // Set the bit rate values according to the profile, default to 500K if an unknown profile
     switch (bitrate->profile) {
         default:
+        case CAN_BITRATE_1M_80:
+            brp = 0U;
+            tseg1 = 30U;
+            tseg2 = 7U;
+            sjw = 7U;
+            break;
         case CAN_BITRATE_500K_75:
             brp = 4U;       // 40MHz / 5 = 8MHz, 16 time quanta per bit
             tseg1 = 10U;    // Sync seg is 1
