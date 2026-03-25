@@ -405,6 +405,8 @@ uint32_t WEAK TIME_CRITICAL can_isr_callback_uref(can_uref_t uref)
 #define             SJW(n)          (((n) & 0x7fU) << 0)
 #define         C1DBTCFG        (0x008U)
 #define         C1TDC           (0x00cU)
+#define             TDCMOD(n)       (((n) & 0x3U) << 16)
+#define             TDCO(n)         (((n) & 0x7fU) << 8)
 #define         C1TBC           (0x010U)
 #define         C1TSCON         (0x014U)
 #define             TSRES           (1U << 18)
@@ -573,9 +575,54 @@ static bool TIME_CRITICAL set_controller_mode_config(can_interface_t *spi_interf
     return false;
 }
 
+INLINE uint32_t build_bit_timing(uint32_t brp, uint32_t tseg1, uint32_t tseg2, uint32_t sjw)
+{
+    return BRP(brp) | TSEG1(tseg1) | TSEG2(tseg2) | SJW(sjw);
+}
+
+static bool resolve_data_bitrate_config(can_data_bitrate_t data_bitrate,
+                                        uint32_t nominal_bit_timing,
+                                        uint32_t *data_bit_timing,
+                                        uint32_t *tdc,
+                                        bool *brs_enabled)
+{
+    if ((data_bit_timing == NULL) || (tdc == NULL) || (brs_enabled == NULL)) {
+        return false;
+    }
+
+    switch (data_bitrate) {
+        case CAN_DATA_BITRATE_NONE:
+            *data_bit_timing = nominal_bit_timing;
+            *tdc = 0U;
+            *brs_enabled = false;
+            return true;
+        case CAN_DATA_BITRATE_2M:
+            // Fixed 2 Mbps data phase at 80% sample point using the 40 MHz controller clock.
+            // Automatic TDC follows the MCP25xxFD guidance for data rates of 1 Mbps and higher.
+            *data_bit_timing = build_bit_timing(0U, 14U, 3U, 3U);
+            *tdc = TDCMOD(2U) | TDCO(15U);
+            *brs_enabled = true;
+            return true;
+        case CAN_DATA_BITRATE_4M:
+            // Fixed 4 Mbps data phase at 80% sample point using the 40 MHz controller clock.
+            // Automatic TDC follows the MCP25xxFD guidance for data rates of 1 Mbps and higher.
+            *data_bit_timing = build_bit_timing(0U, 6U, 1U, 1U);
+            *tdc = TDCMOD(2U) | TDCO(7U);
+            *brs_enabled = true;
+            return true;
+        default:
+            return false;
+    }
+}
+
 // From configuration mode, go into requested mode with the defined bit rate
 // Errata: C1CON read can be corrupted
-static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, can_mode_t mode, uint32_t brp, uint32_t tseg1, uint32_t tseg2, uint32_t sjw)
+static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface,
+                                              can_mode_t mode,
+                                              uint32_t nominal_bit_timing,
+                                              uint32_t data_bit_timing,
+                                              uint32_t tdc,
+                                              bool brs_enabled)
 {
     // NB: The MCP251xFD pins must have been initialized before calling this function
     // Must be called with interrupts locked
@@ -586,11 +633,9 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
     current_mode = (c1con >> 21) & 0x7U;
 
     if (current_mode == 4U) {
-        // Preload both nominal and data bit timing registers. FD mode remains disabled
-        // until a later step, so the C1DBTCFG value is not active yet.
-        uint32_t bit_timing = BRP(brp) | TSEG1(tseg1) | TSEG2(tseg2) | SJW(sjw);
-        write_word(spi_interface, C1NBTCFG, bit_timing);
-        write_word(spi_interface, C1DBTCFG, bit_timing);
+        write_word(spi_interface, C1NBTCFG, nominal_bit_timing);
+        write_word(spi_interface, C1DBTCFG, data_bit_timing);
+        write_word(spi_interface, C1TDC, tdc);
 
         // Set timestamping counter
         // Set prescaler to /40 to count microseconds
@@ -618,8 +663,7 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
         enable_controller_interrupts(spi_interface, 0);
 
         // Enable transmit queue, store in transmit event FIFO, and use CAN FD-capable
-        // controller mode so payloads larger than 8 bytes can be transmitted. BRSDIS keeps
-        // the whole frame at the nominal bit rate for now.
+        // controller mode so payloads larger than 8 bytes can be transmitted.
         // Select mode
         uint32_t reqop;
         switch (mode) {
@@ -644,8 +688,12 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
         // Try multiple times to put the controller into the desired mode, then give up with
         // an error. This might take some time because it has to wait for bus idle, which could
         // take up to a frame time to happen (134us at 500kbit/sec, much longer at slow bit rates)
+        uint32_t c1con_config = STEF | TXQEN | ISOCRCEN | REQOP(reqop);
+        if (!brs_enabled) {
+            c1con_config |= BRSDIS;
+        }
         for (uint32_t i = 0; i < 64U; i++) {
-            write_word(spi_interface, C1CON, STEF | TXQEN | BRSDIS | ISOCRCEN | REQOP(reqop));
+            write_word(spi_interface, C1CON, c1con_config);
             c1con = read_word_crc(spi_interface, C1CON);
             uint32_t current_mode = (c1con >> 21) & 0x7U;
             if (current_mode == reqop) {
@@ -724,6 +772,9 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             }
             if (fd_frame) {
                 t[1] |= (1U << 7);
+                if (controller->data_bitrate != CAN_DATA_BITRATE_NONE) {
+                    t[1] |= (1U << 6);
+                }
             }
             if (frame->remote) {
                 t[1] |= (1U << 5);
@@ -1390,6 +1441,10 @@ can_errorcode_t can_setup_controller(can_controller_t *controller,
     uint8_t tseg1;
     uint8_t tseg2;
     uint8_t sjw;
+    uint32_t nominal_bit_timing;
+    uint32_t data_bit_timing;
+    uint32_t tdc;
+    bool brs_enabled;
 
     if (all_filters != CAN_NO_FILTERS && all_filters->n_filters > CAN_MAX_ID_FILTERS) {
         return CAN_ERC_RANGE;   // Only up to 32 filters possible
@@ -1524,6 +1579,11 @@ can_errorcode_t can_setup_controller(can_controller_t *controller,
             break;
     }
 
+    nominal_bit_timing = build_bit_timing(brp, tseg1, tseg2, sjw);
+    if (!resolve_data_bitrate_config(bitrate->data_bitrate, nominal_bit_timing, &data_bit_timing, &tdc, &brs_enabled)) {
+        return CAN_ERC_BAD_BITRATE;
+    }
+
     // Won't go into config mode then return an error
     if (!set_controller_mode_config(spi_interface)) {
         return CAN_ERC_BAD_INIT;
@@ -1580,6 +1640,7 @@ can_errorcode_t can_setup_controller(can_controller_t *controller,
     // Record details of the controller
     controller->options = options;
     controller->mode = mode;
+    controller->data_bitrate = bitrate->data_bitrate;
     controller->target_specific.seq_bad = 0;
     controller->target_specific.txqua_bad = 0;
     controller->target_specific.txqsta_bad = 0;
@@ -1587,7 +1648,7 @@ can_errorcode_t can_setup_controller(can_controller_t *controller,
     controller->target_specific.spurious = 0;
     controller->target_specific.crc_bad = 0;
 
-    if (!set_controller_mode(spi_interface, mode, brp, tseg1, tseg2, sjw)) {
+    if (!set_controller_mode(spi_interface, mode, nominal_bit_timing, data_bit_timing, tdc, brs_enabled)) {
         // Won't go into the requested mode, return an error
         return CAN_ERC_BAD_INIT;
     }

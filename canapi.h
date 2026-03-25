@@ -204,6 +204,13 @@ typedef enum {
     CAN_BITRATE_CUSTOM,         // A custom profile (other parameters must be defined)
 } can_profile_t;
 
+/// @brief CAN FD data-phase bitrate presets
+typedef enum {
+    CAN_DATA_BITRATE_NONE = 0,  // Disable bitrate switching
+    CAN_DATA_BITRATE_2M,        // 2Mbit/sec data phase with an 80% sample point
+    CAN_DATA_BITRATE_4M,        // 4Mbit/sec data phase with an 80% sample point
+} can_data_bitrate_t;
+
 /// @brief Structure holding the profile and other parameters
 typedef struct {
     can_profile_t profile;
@@ -211,6 +218,7 @@ typedef struct {
     uint8_t tseg1;              // CAN TSEG1 - 1
     uint8_t tseg2;              // CAN TSGE2 - 1
     uint8_t sjw;                // CAN SJW - 1
+    can_data_bitrate_t data_bitrate; // CAN FD data-phase bitrate preset
 } can_bitrate_t;
 
 /// @brief Event types
@@ -346,6 +354,7 @@ typedef struct {
 
     can_mode_t mode;
     uint16_t options;
+    can_data_bitrate_t data_bitrate;
 
     // Controller specific data
     can_controller_target_t target_specific;
