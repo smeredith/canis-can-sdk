@@ -185,22 +185,6 @@ typedef enum {
 
 /// @brief Standard CAN bit rate profiles
 typedef enum {
-    CAN_BITRATE_500K_75 = 0,    // 500kbit/sec 75% sample point
-    CAN_BITRATE_250K_75,        // 250kbit/sec 75% sample point 
-    CAN_BITRATE_125K_75,        // 125kbit/sec 75% sample point
-    CAN_BITRATE_1M_75,          // 1Mbit/sec 75% sample point
-    CAN_BITRATE_500K_50,        // 500kbit/sec 50% sample
-    CAN_BITRATE_250K_50,        // 250kbit/sec 50% sample point 
-    CAN_BITRATE_125K_50,        // 125kbit/sec 50% sample point
-    CAN_BITRATE_1M_50,          // 1Mbit/sec 50% sample point
-    CAN_BITRATE_2M_50,          // 2Mbit/sec 50% sample point NON STANDARD
-    CAN_BITRATE_4M_90,          // 4Mbit/sec 50% sample point NON STANDARD
-    CAN_BITRATE_2_5M_75 ,       // 2.5Mbit/sec 75% sample point NON STANDARD
-    CAN_BITRATE_2M_80,          // 2Mbit/sec 80% sample point NON STANDARD
-    CAN_BITRATE_500K_875,       // 500kbit/sec 87.5% sample
-    CAN_BITRATE_250K_875,       // 250kbit/sec 87.5% sample point (J1939, CANOpen) 
-    CAN_BITRATE_125K_875,       // 125kbit/sec 87.5% sample point
-    CAN_BITRATE_1M_875,         // 1Mbit/sec 85.5% sample point
     CAN_BITRATE_1M_80,      // 1Mbit/sec with 80% sample point
     CAN_BITRATE_CUSTOM,         // A custom profile (other parameters must be defined)
 } can_profile_t;
