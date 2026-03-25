@@ -763,7 +763,8 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             //
             //          A       = 11-bit ID A
             //          B       = 18-bit ID B
-            bool fd_frame = !frame->remote && (can_dlc_to_len(frame->dlc) > 8U);
+            bool brs_frame = !frame->remote && (controller->data_bitrate != CAN_DATA_BITRATE_NONE);
+            bool fd_frame = !frame->remote && ((can_dlc_to_len(frame->dlc) > 8U) || brs_frame);
             t[1] = (free_slot << 9) | frame->dlc;
             // The ID format for CAN IDs already matches the native CAN ID register layout
             t[0] = frame->canid.id & CAN_ID_ARBITRATION_ID;
@@ -772,7 +773,7 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             }
             if (fd_frame) {
                 t[1] |= (1U << 7);
-                if (controller->data_bitrate != CAN_DATA_BITRATE_NONE) {
+                if (brs_frame) {
                     t[1] |= (1U << 6);
                 }
             }
@@ -1479,12 +1480,6 @@ can_errorcode_t can_setup_controller(can_controller_t *controller,
     // Set the bit rate values according to the profile, default to 500K if an unknown profile
     switch (bitrate->profile) {
         default:
-        case CAN_BITRATE_1M_80:
-            brp = 0U;
-            tseg1 = 30U;
-            tseg2 = 7U;
-            sjw = 7U;
-            break;
         case CAN_BITRATE_500K_75:
             brp = 4U;       // 40MHz / 5 = 8MHz, 16 time quanta per bit
             tseg1 = 10U;    // Sync seg is 1
@@ -1581,6 +1576,12 @@ can_errorcode_t can_setup_controller(can_controller_t *controller,
             tseg2 = 2U;
             sjw = 1U;
             break;
+        case CAN_BITRATE_1M_80:
+            brp = 0U;
+            tseg1 = 30U;
+            tseg2 = 7U;
+            sjw = 7U;
+            break;            
         case CAN_BITRATE_CUSTOM:
             brp = bitrate->brp;
             tseg1 = bitrate->tseg1;
