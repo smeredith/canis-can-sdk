@@ -48,7 +48,7 @@ typedef struct {
 #define SPI_Rx                              (8U)
 #define SPI_SCK                             (10U)
 #define SPI_Tx                              (11U)
-#define SPI_IRQ                             (5U)            // Interrupt request
+#define SPI_IRQ                             (5U)            // Interrupt request from CAN controller--not really related to SPI
 #define SPI_CS                              (6U)            // Chip select
 
 // This binds an SPI interface for a specific board. For other devices this will change.
