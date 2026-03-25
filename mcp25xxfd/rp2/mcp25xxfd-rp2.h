@@ -42,9 +42,6 @@ typedef struct {
 
 // Binds the drivers to the CANPico hardware
 #if defined(HOST_CANPICO)
-// These are the physical pin mappings for the CANPico. Other boards using the RP2040
-// and the MCP25xxFD could be on different pins.
-#define XSTBY_GPIO                          (3U)            // Transceiver standby pin
 
 // SPI controller and pins to use
 #define SPI_DEVICE                          (spi1)
@@ -169,18 +166,6 @@ static inline void mcp25xxfd_spi_pins_init(can_interface_t *interface) {
     gpio_set_function(interface->spi_rx, GPIO_FUNC_SPI);
     gpio_set_function(interface->spi_sck, GPIO_FUNC_SPI);
     gpio_set_function(interface->spi_tx, GPIO_FUNC_SPI);
-
-#ifdef HOST_CANPICO
-    // This isn't strictly part of the SPI driver but the pin needs to be set to
-    // enable the CAN transceiver on the CANPico board. Other boards may require
-    // different settings.
-    // Set XSTBY pin to software controlled
-    gpio_set_function(XSTBY_GPIO, GPIO_FUNC_SIO);
-    // Set direction: out
-    gpio_set_dir(XSTBY_GPIO, GPIO_OUT);
-    // Set the XSTBY pin to 0 to enable the transceiver
-    sio_hw->gpio_clr = (1U << XSTBY_GPIO);
-#endif
 
     // Set the chip select pin for the MCP25xxFD as a GPIO port
     gpio_set_function(interface->spi_cs, GPIO_FUNC_SIO);
