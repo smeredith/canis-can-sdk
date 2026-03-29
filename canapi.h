@@ -50,7 +50,7 @@
 
 // Size of data structures use for the CAN driver
 #ifndef CAN_TX_QUEUE_SIZE
-#define CAN_TX_QUEUE_SIZE               (32U)           // Must be less <= 32
+#define CAN_TX_QUEUE_SIZE               (4U)            // Software shadow slots for the hardware TXQ; sizes must match.
 #endif
 
 #ifndef CAN_TX_FIFO_SIZE
@@ -324,7 +324,7 @@ typedef struct {
         uint8_t num_free_slots;                         // Number of free slots in the queue
     } tx_fifo;
 
-    // Software shadow structure for the transmit queue
+    // Software shadow structure for the hardware transmit queue (TXQ)
     //
     // When a frame is queued, a user reference to it is put into this array and the sequence number assigned to
     // the index. That index is used later on transmission to take it out and create a transmit event,
