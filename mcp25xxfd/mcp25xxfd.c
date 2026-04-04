@@ -1357,7 +1357,13 @@ void TIME_CRITICAL mcp25xxfd_irq_handler(can_controller_t *controller)
     }
 
     //////// INTERRUPT EVENT HANDLING LOOP ////////
+    uint32_t guard = 0;
     while (mcp25xxfd_spi_gpio_irq_asserted(spi_interface)) {
+        if (++guard > 64U) {
+            controller->target_specific.spurious++;
+            mcp25xxfd_spi_gpio_disable_irq(spi_interface);
+            break;
+        }
         // Read C1INT and then handle interrupts
         uint32_t events = read_word_crc(spi_interface, C1INT);
         // While the interrupt line is asserted, handle pending events

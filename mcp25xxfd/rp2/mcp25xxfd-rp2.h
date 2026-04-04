@@ -104,25 +104,19 @@ static inline uint32_t mcp25xxfd_convert_bytes(uint32_t w)
 
 static inline void mcp25xxfd_spi_gpio_enable_irq(can_interface_t *interface)
 {
+    gpio_acknowledge_irq(interface->spi_irq, GPIO_IRQ_LEVEL_LOW);
     // If the GPIO interrupts are shared (i.e. another device is connected to GPIO interrupts) then
     // disable them by disabling interrupts on the pin, so that the other devices can continue to
     // handle interrupts through critical sections where the SPI is being accessed.
     gpio_set_irq_enabled(interface->spi_irq, LEVEL_SENSITIVE_LOW, true);
+    irq_set_enabled(IO_IRQ_BANK0, true);
 }
 
 static inline bool mcp25xxfd_spi_gpio_irq_asserted(can_interface_t *interface)
 {
-    // Reads the value of the interrupt pin, returns true if the interrupt pin is asserted
-
-    // If the GPIO interrupts are shared (i.e. another device is connected to GPIO interrupts) then
-    // disable them by disabling interrupts on the pin, so that the other devices can continue to
-    // handle interrupts through critical sections where the SPI is being accessed.
-    if (gpio_get_irq_event_mask(interface->spi_irq) & GPIO_IRQ_LEVEL_LOW) {
-        return true;
-    }
-    else {
-        return false;
-    }
+    // The MCP25xxFD INT line is active-low. Use the live pin state instead of the
+    // IRQ event latch so this behaves consistently across RP2040 and RP2350.
+    return !gpio_get(interface->spi_irq);
 }
 
 static inline void mcp25xxfd_spi_gpio_disable_irq(can_interface_t *interface)
@@ -167,6 +161,12 @@ static inline void mcp25xxfd_spi_pins_init(can_interface_t *interface) {
     gpio_set_function(interface->spi_sck, GPIO_FUNC_SPI);
     gpio_set_function(interface->spi_tx, GPIO_FUNC_SPI);
 
+    // The MCP25xxFD INT line is sampled as a regular GPIO. Make its state explicit
+    // rather than depending on the reset default, which appears to be less forgiving
+    // on RP2350 than RP2040.
+    gpio_init(interface->spi_irq);
+    gpio_pull_up(interface->spi_irq);
+
     // Set the chip select pin for the MCP25xxFD as a GPIO port
     gpio_set_function(interface->spi_cs, GPIO_FUNC_SIO);
     // Set direction: out
@@ -174,9 +174,9 @@ static inline void mcp25xxfd_spi_pins_init(can_interface_t *interface) {
     // Deselect the MCP25xxFD for now
     gpio_set_mask(1U << interface->spi_cs);
 
-    // Now enable GPIO interrupts (there may be other interrupt sources set up in the GPIO interrupt channel
-    // and this may already be enabled)
-    irq_set_enabled(IO_IRQ_BANK0, true);
+    // Leave the shared bank interrupt disabled here and turn it on only when the
+    // device-specific IRQ is enabled. That avoids entering the shared handler while
+    // the controller is still being configured.
 }
 
 #endif // MCP25xxFD_RP2_H
