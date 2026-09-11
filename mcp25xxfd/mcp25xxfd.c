@@ -88,10 +88,34 @@ void debug_printf( const char *format, ... );
 
 // Number of times a CRC-failed transaction will be re-tried
 #define CRC_RETRIES                         (5U)
-// Number of bytes used to store a receive event (CAN frame, error, etc.)
-#define NUM_RX_EVENT_BYTES                  (19U)
+// Number of bytes used to store receive events serialized as bytes
+#define NUM_RX_EVENT_HEADER_BYTES           (11U)
+#define NUM_RX_ERROR_EVENT_BYTES            (15U)
+#define NUM_RX_OVERFLOW_EVENT_BYTES         (15U)
+#define NUM_RX_EVENT_BYTES_MAX              (NUM_RX_EVENT_HEADER_BYTES + CAN_FRAME_MAX_DATA_LEN)
 // Number of bytes used to store a transmission event (CAN frame sent, etc.)
 #define NUM_TX_EVENT_BYTES                  (9U)
+// MCP25xxFD message RAM is 2 KB total, so 64-byte payload objects require shallower hardware queues.
+#define MCP25XXFD_RAM_BYTES                 (2048U)
+#define MCP25XXFD_HW_TEF_DEPTH              (4U)
+#define MCP25XXFD_HW_TXQ_DEPTH              (4U)
+#define MCP25XXFD_HW_RX_FIFO_DEPTH          (22U)
+#define MCP25XXFD_HW_PAYLOAD_CODE           (0x7U)       // 64-byte payload objects
+#define MCP25XXFD_TEF_OBJ_BYTES             (12U)        // TEF timestamp enabled
+#define MCP25XXFD_TXQ_OBJ_BYTES             (8U + CAN_FRAME_MAX_DATA_LEN)
+#define MCP25XXFD_RX_FIFO_OBJ_BYTES         (12U + CAN_FRAME_MAX_DATA_LEN)
+#define MCP25XXFD_TXQ_BASE_ADDR             (MCP25XXFD_HW_TEF_DEPTH * MCP25XXFD_TEF_OBJ_BYTES)
+#define MCP25XXFD_RAM_USAGE_BYTES           ((MCP25XXFD_HW_TEF_DEPTH * MCP25XXFD_TEF_OBJ_BYTES) + \
+                                             (MCP25XXFD_HW_TXQ_DEPTH * MCP25XXFD_TXQ_OBJ_BYTES) + \
+                                             (MCP25XXFD_HW_RX_FIFO_DEPTH * MCP25XXFD_RX_FIFO_OBJ_BYTES))
+
+#if (MCP25XXFD_RAM_USAGE_BYTES > MCP25XXFD_RAM_BYTES)
+#error "MCP25xxFD message RAM allocation exceeds 2 KB"
+#endif
+
+#if (CAN_TX_QUEUE_SIZE < MCP25XXFD_HW_TXQ_DEPTH)
+#error "CAN_TX_QUEUE_SIZE must be >= MCP25XXFD_HW_TXQ_DEPTH"
+#endif
 
 // Write a 32-bit word in big endian format to a buffer
 #define WRITE_BIG_ENDIAN(buf, word)         ((buf)[0] = (uint8_t)(((word) >> 24) & 0xffU),  \
@@ -138,28 +162,25 @@ static void TIME_CRITICAL write_byte(can_interface_t *spi_interface, uint32_t ad
     mcp25xxfd_spi_deselect(spi_interface);
 }
 
-static void TIME_CRITICAL write_4words(can_interface_t *spi_interface, uint16_t addr, const uint32_t words[])
+static void TIME_CRITICAL write_words(can_interface_t *spi_interface, uint16_t addr, const uint32_t words[], uint32_t n)
 {
     // Must be called with interrupts locked
 
-    // Prepare a contiguous buffer for the command because the SPI hardware is pipelined and do not want to stop
-    // to switch buffers
-    uint8_t cmd[18];
-    // MCP251xFD SPI transaction = command/addr, 4 bytes
+    // Send the command first, then stream words in little-endian order.
+    uint8_t cmd[2];
     cmd[0] = 0x20 | ((addr >> 8U) & 0xfU);
     cmd[1] = addr & 0xffU;
 
-    uint32_t i = 2U;
-    for (uint32_t j = 0; j < 4U; j++) {
-        cmd[i++] = words[j] & 0xffU;
-        cmd[i++] = (words[j] >> 8) & 0xffU;
-        cmd[i++] = (words[j] >> 16) & 0xffU;
-        cmd[i++] = (words[j] >> 24) & 0xffU;
-    }
-
-    // SPI transaction
     mcp25xxfd_spi_select(spi_interface);
     mcp25xxfd_spi_write(spi_interface, cmd, sizeof(cmd));
+    for (uint32_t j = 0; j < n; j++) {
+        uint8_t buf[4];
+        buf[0] = words[j] & 0xffU;
+        buf[1] = (words[j] >> 8) & 0xffU;
+        buf[2] = (words[j] >> 16) & 0xffU;
+        buf[3] = (words[j] >> 24) & 0xffU;
+        mcp25xxfd_spi_write(spi_interface, buf, sizeof(buf));
+    }
     mcp25xxfd_spi_deselect(spi_interface);
 }
 
@@ -374,14 +395,18 @@ uint32_t WEAK TIME_CRITICAL can_isr_callback_uref(can_uref_t uref)
 #define             OPMOD(n)        (((n) & 0xfU) << 21)
 #define             TXQEN           (1U << 20)
 #define             STEF            (1U << 19)
+#define             BRSDIS          (1U << 12)
+#define             ISOCRCEN        (1U << 5)
 #define             PXEDIS          (1U << 6)
 #define         C1NBTCFG        (0x004U)
 #define             BRP(n)          (((n) & 0xffU) << 24)
 #define             TSEG1(n)        (((n) & 0xffU) << 16)
 #define             TSEG2(n)        (((n) & 0x7fU) << 8)
 #define             SJW(n)          (((n) & 0x7fU) << 0)
-#define         C2DBTCFG        (0x008U)
+#define         C1DBTCFG        (0x008U)
 #define         C1TDC           (0x00cU)
+#define             TDCMOD(n)       (((n) & 0x3U) << 16)
+#define             TDCO(n)         (((n) & 0x7fU) << 8)
 #define         C1TBC           (0x010U)
 #define         C1TSCON         (0x014U)
 #define             TSRES           (1U << 18)
@@ -456,6 +481,10 @@ uint32_t WEAK TIME_CRITICAL can_isr_callback_uref(can_uref_t uref)
 #define         C1FLTOBJ(n)     (((n) * 8U) + 0x1f0U)
 #define         C1MASK(n)       (((n) * 8U) + 0x1f4U)
 
+#define MCP25XXFD_TEFCON_CONFIG            (FSIZE(MCP25XXFD_HW_TEF_DEPTH - 1U) | TEFTSEN | TEFNEIE)
+#define MCP25XXFD_TXQCON_CONFIG            (PLSIZE(MCP25XXFD_HW_PAYLOAD_CODE) | FSIZE(MCP25XXFD_HW_TXQ_DEPTH - 1U) | TXAT(0x3U))
+#define MCP25XXFD_RXFIFOCON1_CONFIG        (PLSIZE(MCP25XXFD_HW_PAYLOAD_CODE) | FSIZE(MCP25XXFD_HW_RX_FIFO_DEPTH - 1U) | RXTSEN | TFNRFNIE)
+
 // Hard reset of the MCP251xFD using a special SPI command
 static void TIME_CRITICAL hard_reset(can_interface_t *spi_interface)
 {
@@ -478,6 +507,7 @@ static void TIME_CRITICAL set_controller_pins(can_interface_t *spi_interface, bo
     write_word(spi_interface, OSC, 0);
     // Set up IOCON by setting:
     //
+    // INTOD=1 to select open-drain mode for INT
     // SOF=1 to select SOF on CLKO
     // TXCANOD=1 to select open collector transmit pin
     // PM1=1 to use pin as GPIO1
@@ -545,9 +575,54 @@ static bool TIME_CRITICAL set_controller_mode_config(can_interface_t *spi_interf
     return false;
 }
 
+INLINE uint32_t build_bit_timing(uint32_t brp, uint32_t tseg1, uint32_t tseg2, uint32_t sjw)
+{
+    return BRP(brp) | TSEG1(tseg1) | TSEG2(tseg2) | SJW(sjw);
+}
+
+static bool resolve_data_bitrate_config(can_data_bitrate_t data_bitrate,
+                                        uint32_t nominal_bit_timing,
+                                        uint32_t *data_bit_timing,
+                                        uint32_t *tdc,
+                                        bool *brs_enabled)
+{
+    if ((data_bit_timing == NULL) || (tdc == NULL) || (brs_enabled == NULL)) {
+        return false;
+    }
+
+    switch (data_bitrate) {
+        case CAN_DATA_BITRATE_NONE:
+            *data_bit_timing = nominal_bit_timing;
+            *tdc = 0U;
+            *brs_enabled = false;
+            return true;
+        case CAN_DATA_BITRATE_2M:
+            // Fixed 2 Mbps data phase at 80% sample point using the 40 MHz controller clock.
+            // Automatic TDC follows the MCP25xxFD guidance for data rates of 1 Mbps and higher.
+            *data_bit_timing = build_bit_timing(0U, 14U, 3U, 3U);
+            *tdc = TDCMOD(2U) | TDCO(15U);
+            *brs_enabled = true;
+            return true;
+        case CAN_DATA_BITRATE_4M:
+            // Fixed 4 Mbps data phase at 80% sample point using the 40 MHz controller clock.
+            // Automatic TDC follows the MCP25xxFD guidance for data rates of 1 Mbps and higher.
+            *data_bit_timing = build_bit_timing(0U, 6U, 1U, 1U);
+            *tdc = TDCMOD(2U) | TDCO(7U);
+            *brs_enabled = true;
+            return true;
+        default:
+            return false;
+    }
+}
+
 // From configuration mode, go into requested mode with the defined bit rate
 // Errata: C1CON read can be corrupted
-static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, can_mode_t mode, uint32_t brp, uint32_t tseg1, uint32_t tseg2, uint32_t sjw)
+static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface,
+                                              can_mode_t mode,
+                                              uint32_t nominal_bit_timing,
+                                              uint32_t data_bit_timing,
+                                              uint32_t tdc,
+                                              bool brs_enabled)
 {
     // NB: The MCP251xFD pins must have been initialized before calling this function
     // Must be called with interrupts locked
@@ -558,8 +633,9 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
     current_mode = (c1con >> 21) & 0x7U;
 
     if (current_mode == 4U) {
-        // Set bit rate values
-        write_word(spi_interface, C1NBTCFG, BRP(brp) | TSEG1(tseg1) | TSEG2(tseg2) | SJW(sjw));
+        write_word(spi_interface, C1NBTCFG, nominal_bit_timing);
+        write_word(spi_interface, C1DBTCFG, data_bit_timing);
+        write_word(spi_interface, C1TDC, tdc);
 
         // Set timestamping counter
         // Set prescaler to /40 to count microseconds
@@ -567,32 +643,33 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
         write_word(spi_interface, C1TSCON, TBCEN | TBCPRE(39U));
 
         // Transmit event FIFO control register
-        // FSIZE 32-deep
+        // Reduced depth to keep room in message RAM for 64-byte RX/TX objects.
         // TEFTSEN Timestamp transmissions
         // TEFNEIIE not empty interrupt enable
-        write_word(spi_interface, C1TEFCON, FSIZE(0x1fU) | TEFTSEN | TEFNEIE);
+        write_word(spi_interface, C1TEFCON, MCP25XXFD_TEFCON_CONFIG);
 
         // Transmit queue control register
-        // FSIZE 32-deep
+        // Reduced depth to bias message RAM toward the receive FIFO.
         // TXAT Unlimited retransmissions (this field isn't active but set it anyway)
-        write_word(spi_interface, C1TXQCON, FSIZE(0x1fU) | TXAT(0x3U));
+        write_word(spi_interface, C1TXQCON, MCP25XXFD_TXQCON_CONFIG);
 
         // FIFO 1 is the receive FIFO
-        // FSIZE 32-deep
+        // Sized as large as will fit with 64-byte message objects and the smaller TEF/TXQ above.
         // RXTSEN Timestamp receptions
         // TFNRFNIE interrupts enabled
-        write_word(spi_interface, C1FIFOCON1, FSIZE(0x1fU) | RXTSEN | TFNRFNIE);
+        write_word(spi_interface, C1FIFOCON1, MCP25XXFD_RXFIFOCON1_CONFIG);
 
         // Enable the interrupts, don't dismiss any pending ones
         enable_controller_interrupts(spi_interface, 0);
 
-        // Enable transmit queue, store in transmit event FIFO, CAN 2.0 mode
+        // Enable transmit queue, store in transmit event FIFO, and use CAN FD-capable
+        // controller mode so payloads larger than 8 bytes can be transmitted.
         // Select mode
         uint32_t reqop;
         switch (mode) {
             default:
             case CAN_MODE_NORMAL:
-                reqop = 6U;
+                reqop = 0U;
                 break;
             case CAN_MODE_LISTEN_ONLY:
                 reqop = 3U;
@@ -603,13 +680,20 @@ static bool TIME_CRITICAL set_controller_mode(can_interface_t *spi_interface, ca
             case CAN_MODE_OFFLINE:
                 reqop = 4U;
                 break;
+            case CAN_MODE_LOOPBACK:
+                reqop = 2U;
+                break;
         }
 
         // Try multiple times to put the controller into the desired mode, then give up with
         // an error. This might take some time because it has to wait for bus idle, which could
         // take up to a frame time to happen (134us at 500kbit/sec, much longer at slow bit rates)
+        uint32_t c1con_config = STEF | TXQEN | ISOCRCEN | REQOP(reqop);
+        if (!brs_enabled) {
+            c1con_config |= BRSDIS;
+        }
         for (uint32_t i = 0; i < 64U; i++) {
-            write_word(spi_interface, C1CON, STEF | TXQEN | REQOP(reqop));
+            write_word(spi_interface, C1CON, c1con_config);
             c1con = read_word_crc(spi_interface, C1CON);
             uint32_t current_mode = (c1con >> 21) & 0x7U;
             if (current_mode == reqop) {
@@ -655,19 +739,21 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             // such corruption has been seen and so we use a CRC-protected read.
             uint16_t c1txqua = (uint16_t)read_word_crc(spi_interface, C1TXQUA);
             uint16_t addr = c1txqua + 0x400U;
-            // (Transmit event slots start at an offset of 0 (a total of 3 x 4 bytes x 32 slots = 384 bytes)
-            // Transmit queue slots start at an offset 0x180, and each is 16 bytes (we allocated 16 bytes to the
-            // data even though handling only CAN frames, meaning the whole buffer slot is 16 bytes)
-            uint32_t free_slot = (c1txqua - 0x180U) >> 4;
+            // The TXQ starts immediately after the TEF allocation in message RAM.
+            if ((c1txqua < MCP25XXFD_TXQ_BASE_ADDR) || (((c1txqua - MCP25XXFD_TXQ_BASE_ADDR) % MCP25XXFD_TXQ_OBJ_BYTES) != 0U)) {
+                controller->target_specific.txqua_bad++;
+                return false;
+            }
+            uint32_t free_slot = (c1txqua - MCP25XXFD_TXQ_BASE_ADDR) / MCP25XXFD_TXQ_OBJ_BYTES;
 
             ////// Error checking: should not happen if the hardware is behaving correctly
-            if (free_slot >= CAN_TX_QUEUE_SIZE) {
+            if (free_slot >= MCP25XXFD_HW_TXQ_DEPTH) {
                 controller->target_specific.txqua_bad++;
                 return false;
             }
             // Copy the frame into the message slot in the controller
             // Layout of TXQ message object:
-            uint32_t t[4];
+            uint32_t t[2U + CAN_FRAME_MAX_DATA_WORDS];
             
             // CAN ID in the controller is in the following format:
             //          31       23       15       7
@@ -677,21 +763,27 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             //
             //          A       = 11-bit ID A
             //          B       = 18-bit ID B
+            bool brs_frame = !frame->remote && (controller->data_bitrate != CAN_DATA_BITRATE_NONE);
+            bool fd_frame = !frame->remote && ((can_dlc_to_len(frame->dlc) > 8U) || brs_frame);
             t[1] = (free_slot << 9) | frame->dlc;
             // The ID format for CAN IDs already matches the native CAN ID register layout
             t[0] = frame->canid.id & CAN_ID_ARBITRATION_ID;
             if (can_id_is_extended(frame->canid)) {
                 t[1] |= (1U << 4); // Also set the IDE bit
             }
+            if (fd_frame) {
+                t[1] |= (1U << 7);
+                if (brs_frame) {
+                    t[1] |= (1U << 6);
+                }
+            }
             if (frame->remote) {
                 t[1] |= (1U << 5);
             }
-            // These words together represent a block of 8 bytes, data byte 0 at the lowest address,
-            // data in the controller is in little endian format that matches this. If the host is
-            // a big endian CPU then the word must be flipped to little endian first.
-
-            t[2] = mcp25xxfd_convert_bytes(frame->data[0]);
-            t[3] = mcp25xxfd_convert_bytes(frame->data[1]);
+            // Data words are laid out little-endian in message RAM. The payload area is fixed at 64 bytes.
+            for (uint32_t i = 0; i < CAN_FRAME_MAX_DATA_WORDS; i++) {
+                t[2U + i] = mcp25xxfd_convert_bytes(frame->data[i]);
+            }
 
             // Mark slot and update next free slot
             if (fifo) {
@@ -707,12 +799,12 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
 
             // TODO could use a DMA channel and chain these SPI transactions using DMA
             // Write this block over SPI
-            write_4words(spi_interface, addr, t);
+            write_words(spi_interface, addr, t, 2U + CAN_FRAME_MAX_DATA_WORDS);
 
             // Now tell the controller to take the frame and move C1TXQUA
             // Set UINC=1, TXREQ=1
             // Transmit queue control register
-            write_word(spi_interface, C1TXQCON, UINC | TXREQ);
+            write_word(spi_interface, C1TXQCON, MCP25XXFD_TXQCON_CONFIG | UINC | TXREQ);
 
             return true;
         }
@@ -735,6 +827,19 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
     }
 }
 
+INLINE uint8_t can_buffer_chunk_len(size_t available)
+{
+    if (available >= 64U) return 64U;
+    if (available >= 48U) return 48U;
+    if (available >= 32U) return 32U;
+    if (available >= 24U) return 24U;
+    if (available >= 20U) return 20U;
+    if (available >= 16U) return 16U;
+    if (available >= 12U) return 12U;
+    if (available >= 8U) return 8U;
+    return (uint8_t)available;
+}
+
 // Erase all transmit buffers (called by initialization and also as a response
 // to bus-off since those frames will have been erased from the controller by
 // the automatic bus-off recovery)
@@ -751,8 +856,8 @@ static void TIME_CRITICAL init_tx_buffers(can_controller_t *controller)
         controller->tx_pri_queue.uref[i] = can_uref_null;
         controller->tx_pri_queue.uref_valid[i] = false;
     }
-    controller->tx_pri_queue.num_free_slots = CAN_TX_QUEUE_SIZE;
-    controller->tx_pri_queue.fifo_slot = CAN_TX_FIFO_SIZE;
+    controller->tx_pri_queue.num_free_slots = MCP25XXFD_HW_TXQ_DEPTH;
+    controller->tx_pri_queue.fifo_slot = CAN_TX_QUEUE_SIZE;
 }
 
 // At present there is a single CAN controller on the board so there is no need to work out which
@@ -780,7 +885,7 @@ static void TIME_CRITICAL tx_handler(can_controller_t *controller)
     // The sequence number may have been corrupted over SPI by noise so we treat it with some
     // suspicion. If it doesn't refer to a valid slot then we dismiss the interrupt without
     // processing it.
-    if (seq > CAN_TX_QUEUE_SIZE || !controller->tx_pri_queue.uref_valid[seq]) {
+    if (seq >= CAN_TX_QUEUE_SIZE || !controller->tx_pri_queue.uref_valid[seq]) {
         // Bad SEQ value, keep a count of it and then dismiss the interrupt. This will result
         // in the transmit buffer slot not being cleared, so slowly the buffer will run out of
         // space. But the CRC-protected read should not permit this to fail (it returns 0xffffffffU
@@ -793,7 +898,7 @@ static void TIME_CRITICAL tx_handler(can_controller_t *controller)
 
         // Remove frame from the transmit queue
         if (fifo) {
-            controller->tx_pri_queue.fifo_slot = CAN_TX_FIFO_SIZE;
+            controller->tx_pri_queue.fifo_slot = CAN_TX_QUEUE_SIZE;
         }
         can_uref_t uref = controller->tx_pri_queue.uref[seq];
         // The user-reference as no longer valid
@@ -864,7 +969,7 @@ static void TIME_CRITICAL tx_handler(can_controller_t *controller)
     // MCP251xFD interrupts are level-sensitive so GPIO must be set to level sensitive; interrupt
     // will be re-raised if still not empty when serviced.
     // Set FSIZE, UINC, TEFTSEN, TEFNEIE
-    write_word(spi_interface, C1TEFCON, FSIZE(0x1fU) | UINC | TEFTSEN | TEFNEIE);
+    write_word(spi_interface, C1TEFCON, MCP25XXFD_TEFCON_CONFIG | UINC);
 }
 
 // Errata: C1TREC read can be corrupted
@@ -954,8 +1059,8 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
     uint16_t addr = (uint16_t)read_word_crc(spi_interface, C1FIFOUA1) + 0x400U;
 
     // Pick up the frame
-    uint32_t r[5];
-    read_words(spi_interface, addr, r, 5U);
+    uint32_t r[3U + CAN_FRAME_MAX_DATA_WORDS];
+    read_words(spi_interface, addr, r, 3U + CAN_FRAME_MAX_DATA_WORDS);
 
     // Get to the receive callback as quickly as possible
 
@@ -976,28 +1081,30 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
     canid.id = arbitration_id | (!!ide << CAN_ID_EXT_BIT);
 
     uint8_t dlc = r[1] & 0xfU;
-    bool remote = (r[1] & (1U << 5)) != 0;
+    bool fdf = (r[1] & (1U << 7)) != 0;
+    bool brs = (r[1] & (1U << 6)) != 0;
+    bool remote = ((r[1] & (1U << 5)) != 0) && !fdf;
     uint8_t id_filter = (r[1] >> 11) & 0x1fU;
     uint32_t timestamp = r[2];
     // The data is pulled in little endian format into a word, and must be written to
     // memory in little endian format with the lowest address byte set to bits 7:0 of
     // the word.
-    uint32_t data_0 = mcp25xxfd_convert_bytes(r[3]);
-    uint32_t data_1 = mcp25xxfd_convert_bytes(r[4]);
-
-    can_frame_t frame = {.canid = canid,
+    can_frame_t frame = {.uref = can_uref_null,
+                         .canid = canid,
                          .dlc = dlc,
                          .remote = remote,
-                         .data[0] = data_0,
-                         .data[1] = data_1,
+                         .format = fdf ? (brs ? CAN_FRAME_FORMAT_FD_BRS : CAN_FRAME_FORMAT_FD) : CAN_FRAME_FORMAT_CLASSIC,
                          .id_filter = id_filter};
+    for (uint32_t i = 0; i < CAN_FRAME_MAX_DATA_WORDS; i++) {
+        frame.data[i] = mcp25xxfd_convert_bytes(r[3U + i]);
+    }
 
     // Callback is a good place to put any CAN ID or payload triggering function
     can_isr_callback_frame_rx(&frame, timestamp);
 
     // Mark the frame as taken, ensure that timestamping and the not-empty interrupt are still enabled
     // Set UINC, RXTSEN, TFNRFNIE. This will dismiss the interrupt level (if there are no other interrupts)
-    write_word(spi_interface, C1FIFOCON1, UINC | RXTSEN | TFNRFNIE);
+    write_word(spi_interface, C1FIFOCON1, MCP25XXFD_RXFIFOCON1_CONFIG | UINC);
 
     bool ignore_overflow = controller->options & CAN_OPTION_REJECT_OVERFLOW;
     bool ignore_remote = controller->options & CAN_OPTION_REJECT_REMOTE;
@@ -1082,6 +1189,19 @@ static void TIME_CRITICAL pop_rx_event(can_controller_t *controller, can_rx_even
     *dest = controller->rx_fifo.rx_events[idx];
 }
 
+static size_t rx_event_num_bytes(const can_rx_event_t *event)
+{
+    switch (event->event_type) {
+        case CAN_EVENT_TYPE_RECEIVED_FRAME:
+            return NUM_RX_EVENT_HEADER_BYTES + can_frame_get_data_len(&event->event.frame);
+        case CAN_EVENT_TYPE_CAN_ERROR:
+            return NUM_RX_ERROR_EVENT_BYTES;
+        case CAN_EVENT_TYPE_OVERFLOW:
+        default:
+            return NUM_RX_OVERFLOW_EVENT_BYTES;
+    }
+}
+
 // Pop an event from the receive event FIFO and convert it into bytes
 static void TIME_CRITICAL pop_rx_event_as_bytes(can_controller_t *controller, uint8_t *buf)
 {
@@ -1111,13 +1231,16 @@ static void TIME_CRITICAL pop_rx_event_as_bytes(can_controller_t *controller, ui
     }
     else if (ev == CAN_EVENT_TYPE_RECEIVED_FRAME) {
         // Pack out the rest of the bytes with the frame details
-        // Add flag info to indicate a remote frame
+        // Add flag info to indicate remote / FD / BRS frame properties.
         buf[0] |= controller->rx_fifo.rx_events[idx].event.frame.remote ? 0x80U : 0x00U;
+        buf[0] |= can_frame_is_fd(&controller->rx_fifo.rx_events[idx].event.frame) ? 0x40U : 0x00U;
+        buf[0] |= can_frame_uses_bitrate_switch(&controller->rx_fifo.rx_events[idx].event.frame) ? 0x20U : 0x00U;
         // DLC, ID filter hit, timestamp, CAN ID, data
         buf[5] = controller->rx_fifo.rx_events[idx].event.frame.dlc;
         buf[6] = controller->rx_fifo.rx_events[idx].event.frame.id_filter;
         WRITE_BIG_ENDIAN(buf + 7U, controller->rx_fifo.rx_events[idx].event.frame.canid.id);
-        for (size_t i = 0; i < 8U; i++) {
+        size_t data_len = can_frame_get_data_len(&controller->rx_fifo.rx_events[idx].event.frame);
+        for (size_t i = 0; i < data_len; i++) {
             buf[11U + i] = *((uint8_t *) (controller->rx_fifo.rx_events[idx].event.frame.data) + i);
         }
     }
@@ -1234,7 +1357,13 @@ void TIME_CRITICAL mcp25xxfd_irq_handler(can_controller_t *controller)
     }
 
     //////// INTERRUPT EVENT HANDLING LOOP ////////
+    uint32_t guard = 0;
     while (mcp25xxfd_spi_gpio_irq_asserted(spi_interface)) {
+        if (++guard > 64U) {
+            controller->target_specific.spurious++;
+            mcp25xxfd_spi_gpio_disable_irq(spi_interface);
+            break;
+        }
         // Read C1INT and then handle interrupts
         uint32_t events = read_word_crc(spi_interface, C1INT);
         // While the interrupt line is asserted, handle pending events
@@ -1300,7 +1429,7 @@ void can_status_request_recover(can_controller_t *controller)
 // Create the CAN instance and initialize the controller
 // The caller should already have bound the controller to the interface via
 // the host-specific API call for binding.
-can_errorcode_t TIME_CRITICAL can_setup_controller(can_controller_t *controller,
+can_errorcode_t can_setup_controller(can_controller_t *controller,
                                                    const can_bitrate_t *bitrate,
                                                    const can_id_filters_t *all_filters,
                                                    can_mode_t mode,
@@ -1311,6 +1440,7 @@ can_errorcode_t TIME_CRITICAL can_setup_controller(can_controller_t *controller,
     // 1: CAN_LISTEN_ONLY, does not ever set TX to 0
     // 2: CAN_ACK_ONLY, does not transmit but does set ACK=0
     // 3: CAN_OFFLINE, does not send or receive
+    // 4: CAN_MODE_LOOPBACK, internal loopback for testing
 
     can_interface_t *spi_interface = &controller->host_interface;
 
@@ -1322,6 +1452,10 @@ can_errorcode_t TIME_CRITICAL can_setup_controller(can_controller_t *controller,
     uint8_t tseg1;
     uint8_t tseg2;
     uint8_t sjw;
+    uint32_t nominal_bit_timing;
+    uint32_t data_bit_timing;
+    uint32_t tdc;
+    bool brs_enabled;
 
     if (all_filters != CAN_NO_FILTERS && all_filters->n_filters > CAN_MAX_ID_FILTERS) {
         return CAN_ERC_RANGE;   // Only up to 32 filters possible
@@ -1352,108 +1486,23 @@ can_errorcode_t TIME_CRITICAL can_setup_controller(can_controller_t *controller,
     // Set the bit rate values according to the profile, default to 500K if an unknown profile
     switch (bitrate->profile) {
         default:
-        case CAN_BITRATE_500K_75:
-            brp = 4U;       // 40MHz / 5 = 8MHz, 16 time quanta per bit
-            tseg1 = 10U;    // Sync seg is 1
-            tseg2 = 3U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_250K_75: // 250bit/sec, 75%
-            brp = 9U;       // 40MHz / 10 = 8MHz, 16 time quanta per bit
-            tseg1 = 10U;
-            tseg2 = 3U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_125K_75:
-            brp = 19U;      // 40MHz / 20 = 8MHz, 16 time quanta per bit
-            tseg1 = 10U;
-            tseg2 = 3U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_1M_75:
-            brp = 1U;       // 40MHz / 2 = 20MHz, 20 time quanta per bit
-            tseg1 = 13U;
-            tseg2 = 4U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_500K_50:
-            brp = 4U;       // 40MHz / 5 = 8MHz, 16 time quanta per bit
-            tseg1 = 6U;     // Sync seg is 1
-            tseg2 = 7U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_250K_50:
-            brp = 9U;       // 40MHz / 10 = 8MHz, 16 time quanta per bit
-            tseg1 = 6U;     // Sync seg is 1
-            tseg2 = 7U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_125K_50:
-            brp = 19U;      // 40MHz / 20 = 8MHz, 16 time quanta per bit
-            tseg1 = 6U;     // Sync seg is 1
-            tseg2 = 7U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_1M_50:
-            brp = 1U;       // 40MHz / 2 = 20MHz, 20 time quanta per bit
-            tseg1 = 8U;     // Sync seg is 1
-            tseg2 = 9U;
-            sjw = 2U;
-            break;
-        case CAN_BITRATE_2M_50:
-            brp = 0;
-            tseg1 = 8U;
-            tseg2 = 9U;
-            sjw = 1U;
-            break;
-        case CAN_BITRATE_4M_90:
-            brp = 0;
-            tseg1 = 7U;
-            tseg2 = 0;
-            sjw = 1U;
-            break;
-        case CAN_BITRATE_2_5M_75:
-            brp = 1;
-            tseg1 = 4U;
-            tseg2 = 1U;
-            sjw = 1U;
-            break;
-        case CAN_BITRATE_2M_80:
+        case CAN_BITRATE_1M_80:
             brp = 0U;
-            tseg1 = 14U;
-            tseg2 = 3U;
-            sjw = 1U;
-            break;
-        case CAN_BITRATE_500K_875:
-            brp = 4U;       // 40MHz / 5 = 8MHz, 16 time quanta per bit
-            tseg1 = 12U;    // Sync seg is 1
-            tseg2 = 1U;
-            sjw = 1U;
-            break;
-        case CAN_BITRATE_250K_875: // 250bit/sec, 75%
-            brp = 9U;       // 40MHz / 10 = 8MHz, 16 time quanta per bit
-            tseg1 = 12U;
-            tseg2 = 1U;
-            sjw = 1U;
-            break;
-        case CAN_BITRATE_125K_875:
-            brp = 19U;      // 40MHz / 20 = 8MHz, 16 time quanta per bit
-            tseg1 = 12U;
-            tseg2 = 1U;
-            sjw = 1U;
-            break;
-        case CAN_BITRATE_1M_875:
-            brp = 1U;       // 40MHz / 2 = 20MHz, 20 time quanta per bit
-            tseg1 = 15U;
-            tseg2 = 2U;
-            sjw = 1U;
-            break;
+            tseg1 = 30U;
+            tseg2 = 7U;
+            sjw = 7U;
+            break;            
         case CAN_BITRATE_CUSTOM:
             brp = bitrate->brp;
             tseg1 = bitrate->tseg1;
             tseg2 = bitrate->tseg2;
             sjw = bitrate->sjw;
             break;
+    }
+
+    nominal_bit_timing = build_bit_timing(brp, tseg1, tseg2, sjw);
+    if (!resolve_data_bitrate_config(bitrate->data_bitrate, nominal_bit_timing, &data_bit_timing, &tdc, &brs_enabled)) {
+        return CAN_ERC_BAD_BITRATE;
     }
 
     // Won't go into config mode then return an error
@@ -1512,6 +1561,7 @@ can_errorcode_t TIME_CRITICAL can_setup_controller(can_controller_t *controller,
     // Record details of the controller
     controller->options = options;
     controller->mode = mode;
+    controller->data_bitrate = bitrate->data_bitrate;
     controller->target_specific.seq_bad = 0;
     controller->target_specific.txqua_bad = 0;
     controller->target_specific.txqsta_bad = 0;
@@ -1519,7 +1569,7 @@ can_errorcode_t TIME_CRITICAL can_setup_controller(can_controller_t *controller,
     controller->target_specific.spurious = 0;
     controller->target_specific.crc_bad = 0;
 
-    if (!set_controller_mode(spi_interface, mode, brp, tseg1, tseg2, sjw)) {
+    if (!set_controller_mode(spi_interface, mode, nominal_bit_timing, data_bit_timing, tdc, brs_enabled)) {
         // Won't go into the requested mode, return an error
         return CAN_ERC_BAD_INIT;
     }
@@ -1546,6 +1596,55 @@ can_errorcode_t TIME_CRITICAL can_send_frame(can_controller_t *controller, const
     return queued ? CAN_ERC_NO_ERROR : CAN_ERC_NO_ROOM;
 }
 
+can_errorcode_t TIME_CRITICAL can_send_buffer(can_controller_t *controller,
+                                              bool ide,
+                                              uint32_t arbitration_id,
+                                              const uint8_t *data,
+                                              size_t len,
+                                              bool fifo)
+{
+    if (controller == NULL) {
+        return CAN_ERC_BAD_INIT;
+    }
+    if ((len > 0U) && (data == NULL)) {
+        return CAN_ERC_RANGE;
+    }
+    if (len == 0U) {
+        return CAN_ERC_NO_ERROR;
+    }
+
+    uint32_t n_frames = 0U;
+    size_t remaining = len;
+    while (remaining > 0U) {
+        remaining -= can_buffer_chunk_len(remaining);
+        n_frames++;
+    }
+
+    if (!can_is_space(controller, n_frames, fifo)) {
+        return fifo ? CAN_ERC_NO_ROOM_FIFO : CAN_ERC_NO_ROOM_PRIORITY;
+    }
+
+    can_interface_t *spi_interface = &controller->host_interface;
+    mcp25xxfd_spi_gpio_disable_irq(spi_interface);
+
+    const uint8_t *src = data;
+    remaining = len;
+    while (remaining > 0U) {
+        uint8_t chunk_len = can_buffer_chunk_len(remaining);
+        can_frame_t frame;
+        can_make_frame(&frame, ide, arbitration_id, can_len_to_dlc(chunk_len), src, false);
+        if (!send_frame(controller, &frame, fifo)) {
+            mcp25xxfd_spi_gpio_enable_irq(spi_interface);
+            return CAN_ERC_NO_ROOM;
+        }
+        src += chunk_len;
+        remaining -= chunk_len;
+    }
+
+    mcp25xxfd_spi_gpio_enable_irq(spi_interface);
+    return CAN_ERC_NO_ERROR;
+}
+
 uint32_t TIME_CRITICAL can_recv_as_bytes(can_controller_t *controller, uint8_t *dest, size_t n_bytes)
 {
     // There is a single controller set up
@@ -1553,17 +1652,20 @@ uint32_t TIME_CRITICAL can_recv_as_bytes(can_controller_t *controller, uint8_t *
         // If the controller has not been initialized then return no bytes
         return 0;
     }
-    if (n_bytes < NUM_RX_EVENT_BYTES) {
-        return 0;
-    }
-
     can_interface_t *spi_interface = &controller->host_interface;
 
     uint32_t result;
     mcp25xxfd_spi_gpio_disable_irq(spi_interface);
     if (CAN_RX_FIFO_SIZE - controller->rx_fifo.free) {
-        pop_rx_event_as_bytes(controller, dest);
-        result = NUM_RX_EVENT_BYTES;
+        can_rx_event_t *event = &controller->rx_fifo.rx_events[controller->rx_fifo.head_idx];
+        size_t event_bytes = rx_event_num_bytes(event);
+        if (n_bytes >= event_bytes) {
+            pop_rx_event_as_bytes(controller, dest);
+            result = event_bytes;
+        }
+        else {
+            result = 0;
+        }
     }
     else {
         result = 0;

@@ -50,7 +50,7 @@
 
 // Size of data structures use for the CAN driver
 #ifndef CAN_TX_QUEUE_SIZE
-#define CAN_TX_QUEUE_SIZE               (32U)           // Must be less <= 32
+#define CAN_TX_QUEUE_SIZE               (4U)            // Software shadow slots for the hardware TXQ; sizes must match.
 #endif
 
 #ifndef CAN_TX_FIFO_SIZE
@@ -80,6 +80,9 @@
 #if (CAN_TX_EVENT_FIFO_SIZE > 255)
 #error "CAN_TX_EVENT_FIFO_SIZE must be < 256"
 #endif
+
+#define CAN_FRAME_MAX_DATA_LEN            (64U)
+#define CAN_FRAME_MAX_DATA_WORDS          (CAN_FRAME_MAX_DATA_LEN / sizeof(uint32_t))
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////// DATA STRUCTURES /////////////////////////////////////////////
@@ -182,28 +185,21 @@ typedef enum {
 
 /// @brief Standard CAN bit rate profiles
 typedef enum {
-    CAN_BITRATE_500K_75 = 0,    // 500kbit/sec 75% sample (default)    
-    CAN_BITRATE_250K_75,        // 250kbit/sec 75% sample point 
-    CAN_BITRATE_125K_75,        // 125kbit/sec 75% sample point
-    CAN_BITRATE_1M_75,          // 1Mbit/sec 75% sample point
-    CAN_BITRATE_500K_50,        // 500kbit/sec 50% sample (default)
-    CAN_BITRATE_250K_50,        // 250kbit/sec 50% sample point 
-    CAN_BITRATE_125K_50,        // 125kbit/sec 50% sample point
-    CAN_BITRATE_1M_50,          // 1Mbit/sec 50% sample point
-    CAN_BITRATE_2M_50,          // 2Mbit/sec 50% sample point NON STANDARD
-    CAN_BITRATE_4M_90,          // 4Mbit/sec 50% sample point NON STANDARD
-    CAN_BITRATE_2_5M_75 ,       // 2.5Mbit/sec 75% sample point NON STANDARD
-    CAN_BITRATE_2M_80,          // 2Mbit/sec 80% sample point NON STANDARD
-    CAN_BITRATE_500K_875,       // 500kbit/sec 87.5% sample
-    CAN_BITRATE_250K_875,       // 250kbit/sec 87.5% sample point (J1939, CANOpen) 
-    CAN_BITRATE_125K_875,       // 125kbit/sec 87.5% sample point
-    CAN_BITRATE_1M_875,         // 1Mbit/sec 85.5% sample point
+    CAN_BITRATE_1M_80,      // 1Mbit/sec with 80% sample point
     CAN_BITRATE_CUSTOM,         // A custom profile (other parameters must be defined)
 } can_profile_t;
+
+/// @brief CAN FD data-phase bitrate presets
+typedef enum {
+    CAN_DATA_BITRATE_NONE = 0,  // Disable bitrate switching
+    CAN_DATA_BITRATE_2M,        // 2Mbit/sec data phase with an 80% sample point
+    CAN_DATA_BITRATE_4M,        // 4Mbit/sec data phase with an 80% sample point
+} can_data_bitrate_t;
 
 /// @brief Structure holding the profile and other parameters
 typedef struct {
     can_profile_t profile;
+    can_data_bitrate_t data_bitrate; // CAN FD data-phase bitrate preset
     uint8_t brp;                // Baud rate prescaler (0 = /1)
     uint8_t tseg1;              // CAN TSEG1 - 1
     uint8_t tseg2;              // CAN TSGE2 - 1
@@ -223,7 +219,8 @@ typedef enum {
     CAN_MODE_NORMAL,                        // Can send and receive CAN frames
     CAN_MODE_LISTEN_ONLY,                   // Listen only (don't acknowledge CAN frames)
     CAN_MODE_ACK_ONLY,                      // Listen but do acknowledge CAN frames
-    CAN_MODE_OFFLINE                        // Do not listen or transmit
+    CAN_MODE_OFFLINE,                       // Do not listen or transmit
+    CAN_MODE_LOOPBACK                       // Internal loopback (controller receives its own transmissions, doesn't put them on the bus)
 } can_mode_t;
 
 //////////////////////////////////////////// CAN status ////////////////////////////////////////////
@@ -258,12 +255,20 @@ static uint8_t can_status_get_tec(can_status_t status);
 static uint8_t can_status_get_rec(can_status_t status);
 
 /// @brief Structure holding the details of a CAN frame
+typedef enum {
+    CAN_FRAME_FORMAT_CLASSIC = 0,   // Classic CAN 2.0 frame
+    CAN_FRAME_FORMAT_FD = 1,        // CAN FD frame without bitrate switching
+    CAN_FRAME_FORMAT_FD_BRS = 2,    // CAN FD frame with bitrate switching
+} can_frame_format_t;
+
+/// @brief Structure holding the details of a CAN frame
 typedef struct  {
     can_uref_t uref;    // User-defined data for callbacks to use
     can_id_t canid;     // CAN ID
-    uint32_t data[2];   // Payload stored as two words (but in memory treated as bytes)
+    uint32_t data[CAN_FRAME_MAX_DATA_WORDS]; // Payload stored as words (but in memory treated as bytes)
     uint8_t dlc;        // DLC (0-15)
     uint8_t id_filter;  // Filter hit: index of ID filter that accepted the frame (received only)
+    uint8_t format;     // can_frame_format_t
     bool remote;        // Frame is remote
 } can_frame_t;
 
@@ -319,7 +324,7 @@ typedef struct {
         uint8_t num_free_slots;                         // Number of free slots in the queue
     } tx_fifo;
 
-    // Software shadow structure for the transmit queue
+    // Software shadow structure for the hardware transmit queue (TXQ)
     //
     // When a frame is queued, a user reference to it is put into this array and the sequence number assigned to
     // the index. That index is used later on transmission to take it out and create a transmit event,
@@ -342,6 +347,7 @@ typedef struct {
 
     can_mode_t mode;
     uint16_t options;
+    can_data_bitrate_t data_bitrate;
 
     // Controller specific data
     can_controller_target_t target_specific;
@@ -398,6 +404,20 @@ void can_status_request_recover(can_controller_t *controller);
 /// @param fifo If true, puts the frame into the FIFO queue that feeds into the priority queue
 can_errorcode_t can_send_frame(can_controller_t *controller, const can_frame_t *frame, bool fifo);
 
+/// @brief Split a byte buffer into exact CAN/CAN FD payload sizes and queue the resulting frames
+/// @param ide True if the arbitration ID is 29-bit
+/// @param arbitration_id The 29-bit or 11-bit CAN ID to use for all frames
+/// @param data Pointer to the byte buffer to send
+/// @param len Number of bytes to send
+/// @param fifo If true, puts the frames into the FIFO queue that feeds into the priority queue
+/// @returns CAN_ERC_NO_ERROR on success, otherwise a queueing or initialization error
+can_errorcode_t can_send_buffer(can_controller_t *controller,
+                                bool ide,
+                                uint32_t arbitration_id,
+                                const uint8_t *data,
+                                size_t len,
+                                bool fifo);
+
 /// @brief Returns true if there is space to send a number of frames
 /// @param n_frames The number of frames to send
 /// @param fifo If the frames are to go into the FIFO queue
@@ -415,6 +435,24 @@ INLINE bool can_frame_is_remote(const can_frame_t *frame)
     return frame->remote;
 }
 
+/// @brief Returns the frame format
+INLINE can_frame_format_t can_frame_get_format(const can_frame_t *frame)
+{
+    return (can_frame_format_t)frame->format;
+}
+
+/// @brief Returns true if the frame is a CAN FD frame
+INLINE bool can_frame_is_fd(const can_frame_t *frame)
+{
+    return can_frame_get_format(frame) != CAN_FRAME_FORMAT_CLASSIC;
+}
+
+/// @brief Returns true if the frame uses bitrate switching
+INLINE bool can_frame_uses_bitrate_switch(const can_frame_t *frame)
+{
+    return can_frame_get_format(frame) == CAN_FRAME_FORMAT_FD_BRS;
+}
+
 /// @brief Returns the arbitration ID of the frame
 INLINE uint32_t can_frame_get_arbitration_id(const can_frame_t *frame)
 {
@@ -427,15 +465,67 @@ INLINE uint8_t *can_frame_get_data(const can_frame_t *frame)
     return (uint8_t *)frame->data;
 }
 
+/// @brief Converts a CAN DLC value to a payload length in bytes
+INLINE size_t can_dlc_to_len(uint8_t dlc)
+{
+    dlc &= 0xfU;
+    if (dlc <= 8U) {
+        return dlc;
+    }
+
+    switch (dlc) {
+        case 9U:
+            return 12U;
+        case 10U:
+            return 16U;
+        case 11U:
+            return 20U;
+        case 12U:
+            return 24U;
+        case 13U:
+            return 32U;
+        case 14U:
+            return 48U;
+        default:
+            return 64U;
+    }
+}
+
+/// @brief Converts a payload length in bytes to a CAN DLC value
+INLINE uint8_t can_len_to_dlc(size_t len)
+{
+    if (len <= 8U) {
+        return (uint8_t)len;
+    }
+    if (len <= 12U) {
+        return 9U;
+    }
+    if (len <= 16U) {
+        return 10U;
+    }
+    if (len <= 20U) {
+        return 11U;
+    }
+    if (len <= 24U) {
+        return 12U;
+    }
+    if (len <= 32U) {
+        return 13U;
+    }
+    if (len <= 48U) {
+        return 14U;
+    }
+    return 15U;
+}
+
 /// @brief Returns the number of bytes in the payload
 INLINE size_t can_frame_get_data_len(const can_frame_t *frame)
 {
-    uint8_t len = (frame->dlc & 0x8U) ? 8U : frame->dlc;
     if (can_frame_is_remote(frame)) {
         return 0;
     }
     else {
-        return len;
+        return can_dlc_to_len(frame->dlc);
     }
 }
 
@@ -475,46 +565,23 @@ INLINE void can_make_frame(can_frame_t *frame, bool ide, uint32_t arbitration_id
 {
     // Limit the DLC to 4 bits in case the caller has made an error
     dlc &= 0xfU;
+    size_t data_len = can_dlc_to_len(dlc);
 
     // Fill out the frame details
     frame->canid = can_make_id(ide, arbitration_id);
     frame->dlc = dlc;
     frame->remote = remote;
     frame->id_filter = 0;
+    frame->format = (!remote && (data_len > 8U)) ? CAN_FRAME_FORMAT_FD : CAN_FRAME_FORMAT_CLASSIC;
     frame->uref = can_uref_null;    // User can fill this in later if necessary
-    // Copy the correct number of data bytes in
     uint8_t *dst = (uint8_t *)frame->data;
-    switch(dlc) {
-        // Fallthrough case statement to copy a CAN data from a block of bytes
-        // The source for this may not be word-aligned and memory beyond the specified
-        // number of bytes may not be accessible, so copy exactly the number of bytes.
-        // Because this is inline, the compiler may make a much better job of copying
-        // in cases where a word copy will do.
-        case 15U:
-        case 14U:
-        case 13U:
-        case 12U:
-        case 11U:
-        case 10U:
-        case 9U:
-        case 8U:
-            dst[7] = data[7];
-        case 7U:
-            dst[6] = data[6];
-        case 6U:
-            dst[5] = data[5];
-        case 5U:
-            dst[4] = data[4];
-        case 4U:
-            dst[3] = data[3];
-        case 3U:
-            dst[2] = data[2];
-        case 2U:
-            dst[1] = data[1];
-        case 1U:
-            dst[0] = data[0];
-        default:
-            break;
+    for (size_t i = 0; i < CAN_FRAME_MAX_DATA_LEN; i++) {
+        if ((data != NULL) && (i < data_len)) {
+            dst[i] = data[i];
+        }
+        else {
+            dst[i] = 0U;
+        }
     }
 }
 
@@ -539,11 +606,14 @@ INLINE void can_frame_set_uref(can_frame_t *frame, void *ref)
 
 
 /// @brief Creates a frame from a block of bytes
+/// Byte 0 flag bits: 0x01 remote, 0x02 CAN FD, 0x04 bitrate switch
 /// @param frame Pointer to a frame structure allocated by the application
 /// @param src A pointer to bytes from where the frame will be created
 INLINE void can_make_frame_from_bytes(can_frame_t *frame, const uint8_t *src)
 {
     bool remote = (src[0] & 0x01U) != 0;
+    bool fd = (src[0] & 0x02U) != 0;
+    bool brs = (src[0] & 0x04U) != 0;
     uint8_t dlc = src[1] & 0x0fU;
     uint32_t tag = CAN_READ_BIG_ENDIAN_WORD(src + 3U);
     uint32_t can_id_word = CAN_READ_BIG_ENDIAN_WORD(src + 7U);
@@ -552,13 +622,28 @@ INLINE void can_make_frame_from_bytes(can_frame_t *frame, const uint8_t *src)
     const uint8_t *data = &src[11];
 
     can_make_frame(frame, ide, arbitration_id, dlc, data, remote);
+    if (!remote) {
+        if (brs) {
+            frame->format = CAN_FRAME_FORMAT_FD_BRS;
+        }
+        else if (fd || (can_dlc_to_len(dlc) > 8U)) {
+            frame->format = CAN_FRAME_FORMAT_FD;
+        }
+    }
     // The reference in the frame is the 32-bit tag stored in the frame
     can_frame_set_uref(frame, (void *)tag); 
 }
 
 INLINE void can_make_bytes_from_frame(uint8_t *dest, const can_frame_t *frame, uint32_t tag)
 {
+    // Byte 0 flag bits: 0x01 remote, 0x02 CAN FD, 0x04 bitrate switch
     dest[0] = frame->remote ? 0x1U : 0;
+    if (can_frame_is_fd(frame)) {
+        dest[0] |= 0x02U;
+    }
+    if (can_frame_uses_bitrate_switch(frame)) {
+        dest[0] |= 0x04U;
+    }
     dest[1] = frame->dlc;
     uint32_t can_id_word = can_frame_get_arbitration_id(frame);
     if (can_frame_is_extended(frame)) {
@@ -569,15 +654,10 @@ INLINE void can_make_bytes_from_frame(uint8_t *dest, const can_frame_t *frame, u
     CAN_WRITE_BIG_ENDIAN_WORD(dest + 7U, can_id_word);
 
     uint8_t *data = can_frame_get_data(frame);
-    // Copy the block of data over (unused bytes are copied too)
-    dest[11] = data[0];
-    dest[12] = data[1];
-    dest[13] = data[2];
-    dest[14] = data[3];
-    dest[15] = data[4];
-    dest[16] = data[5];
-    dest[17] = data[6];
-    dest[18] = data[7];
+    size_t data_len = can_frame_get_data_len(frame);
+    for (size_t i = 0; i < data_len; i++) {
+        dest[11U + i] = data[i];
+    }
 }
 
 /////////////////////////////////////// CAN receive overflow ///////////////////////////////////////
