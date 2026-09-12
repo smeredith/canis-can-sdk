@@ -95,15 +95,32 @@ void debug_printf( const char *format, ... );
 #define NUM_RX_EVENT_BYTES_MAX              (NUM_RX_EVENT_HEADER_BYTES + CAN_FRAME_MAX_DATA_LEN)
 // Number of bytes used to store a transmission event (CAN frame sent, etc.)
 #define NUM_TX_EVENT_BYTES                  (9U)
-// MCP25xxFD message RAM is 2 KB total, so 64-byte payload objects require shallower hardware queues.
+// MCP25xxFD message RAM is 2 KB total. This bus's actual traffic (MIDI-over-
+// CAN) never exceeds 12 bytes per frame, so message objects are sized to
+// that instead of the CAN-FD default of 64 bytes -- this both reclaims
+// wasted chip RAM and roughly quadruples the RX FIFO depth (22 -> 80),
+// which is the real defense against dropped frames while the CPU is
+// briefly busy (e.g. a flash write -- see issue #19).
+//
+// PLSIZE encoding (MCP25xxFD datasheet): 0=8, 1=12, 2=16, 3=20, 4=24, 5=32,
+// 6=48, 7=64 bytes.
+//
+// A node ever sending a frame bigger than this doesn't overflow anything --
+// the chip just truncates it on-chip and DLC still reports the sender's
+// true (larger) size. See rx_handler()'s fixed-size read, sized to this
+// constant rather than the API's CAN_FRAME_MAX_DATA_LEN so it never reads
+// past the actual allocated object (which would run off the end of message
+// RAM for the last FIFO slot with a payload size this much smaller than 64).
 #define MCP25XXFD_RAM_BYTES                 (2048U)
 #define MCP25XXFD_HW_TEF_DEPTH              (4U)
 #define MCP25XXFD_HW_TXQ_DEPTH              (4U)
-#define MCP25XXFD_HW_RX_FIFO_DEPTH          (22U)
-#define MCP25XXFD_HW_PAYLOAD_CODE           (0x7U)       // 64-byte payload objects
+#define MCP25XXFD_HW_RX_FIFO_DEPTH          (80U)
+#define MCP25XXFD_HW_PAYLOAD_CODE           (0x1U)       // 12-byte payload objects
+#define MCP25XXFD_HW_PAYLOAD_BYTES          (12U)
+#define MCP25XXFD_HW_PAYLOAD_WORDS          (MCP25XXFD_HW_PAYLOAD_BYTES / 4U)
 #define MCP25XXFD_TEF_OBJ_BYTES             (12U)        // TEF timestamp enabled
-#define MCP25XXFD_TXQ_OBJ_BYTES             (8U + CAN_FRAME_MAX_DATA_LEN)
-#define MCP25XXFD_RX_FIFO_OBJ_BYTES         (12U + CAN_FRAME_MAX_DATA_LEN)
+#define MCP25XXFD_TXQ_OBJ_BYTES             (8U + MCP25XXFD_HW_PAYLOAD_BYTES)
+#define MCP25XXFD_RX_FIFO_OBJ_BYTES         (12U + MCP25XXFD_HW_PAYLOAD_BYTES)
 #define MCP25XXFD_TXQ_BASE_ADDR             (MCP25XXFD_HW_TEF_DEPTH * MCP25XXFD_TEF_OBJ_BYTES)
 #define MCP25XXFD_RAM_USAGE_BYTES           ((MCP25XXFD_HW_TEF_DEPTH * MCP25XXFD_TEF_OBJ_BYTES) + \
                                              (MCP25XXFD_HW_TXQ_DEPTH * MCP25XXFD_TXQ_OBJ_BYTES) + \
@@ -759,7 +776,7 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             }
             // Copy the frame into the message slot in the controller
             // Layout of TXQ message object:
-            uint32_t t[2U + CAN_FRAME_MAX_DATA_WORDS];
+            uint32_t t[2U + MCP25XXFD_HW_PAYLOAD_WORDS];
             
             // CAN ID in the controller is in the following format:
             //          31       23       15       7
@@ -786,8 +803,11 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
             if (frame->remote) {
                 t[1] |= (1U << 5);
             }
-            // Data words are laid out little-endian in message RAM. The payload area is fixed at 64 bytes.
-            for (uint32_t i = 0; i < CAN_FRAME_MAX_DATA_WORDS; i++) {
+            // Data words are laid out little-endian in message RAM. The payload area is
+            // fixed at MCP25XXFD_HW_PAYLOAD_BYTES, not the API's CAN_FRAME_MAX_DATA_LEN --
+            // writing more than that would run into the next TXQ slot (or past message RAM
+            // for the last one).
+            for (uint32_t i = 0; i < MCP25XXFD_HW_PAYLOAD_WORDS; i++) {
                 t[2U + i] = mcp25xxfd_convert_bytes(frame->data[i]);
             }
 
@@ -805,7 +825,7 @@ static bool TIME_CRITICAL send_frame(can_controller_t *controller, const can_fra
 
             // TODO could use a DMA channel and chain these SPI transactions using DMA
             // Write this block over SPI
-            write_words(spi_interface, addr, t, 2U + CAN_FRAME_MAX_DATA_WORDS);
+            write_words(spi_interface, addr, t, 2U + MCP25XXFD_HW_PAYLOAD_WORDS);
 
             // Now tell the controller to take the frame and move C1TXQUA
             // Set UINC=1, TXREQ=1
@@ -1095,9 +1115,15 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
 
     uint16_t addr = (uint16_t)read_word_crc(spi_interface, C1FIFOUA1) + 0x400U;
 
-    // Pick up the frame
-    uint32_t r[3U + CAN_FRAME_MAX_DATA_WORDS];
-    read_words(spi_interface, addr, r, 3U + CAN_FRAME_MAX_DATA_WORDS);
+    // Pick up the frame. Sized to the actually-configured hardware payload
+    // (MCP25XXFD_HW_PAYLOAD_WORDS), not the API's CAN_FRAME_MAX_DATA_LEN --
+    // reading more than that would run into the next RX FIFO slot (or past
+    // message RAM for the last one). A frame whose DLC reports more than
+    // this was truncated on-chip; can_frame_get_data_len() (DLC-derived)
+    // still reports its true size so callers can detect that (see the
+    // "oversize" E line in main.cpp).
+    uint32_t r[3U + MCP25XXFD_HW_PAYLOAD_WORDS];
+    read_words(spi_interface, addr, r, 3U + MCP25XXFD_HW_PAYLOAD_WORDS);
 
     // Get to the receive callback as quickly as possible
 
@@ -1132,9 +1158,12 @@ static void TIME_CRITICAL rx_handler(can_controller_t *controller)
                          .remote = remote,
                          .format = fdf ? (brs ? CAN_FRAME_FORMAT_FD_BRS : CAN_FRAME_FORMAT_FD) : CAN_FRAME_FORMAT_CLASSIC,
                          .id_filter = id_filter};
-    for (uint32_t i = 0; i < CAN_FRAME_MAX_DATA_WORDS; i++) {
+    for (uint32_t i = 0; i < MCP25XXFD_HW_PAYLOAD_WORDS; i++) {
         frame.data[i] = mcp25xxfd_convert_bytes(r[3U + i]);
     }
+    // Any words beyond MCP25XXFD_HW_PAYLOAD_WORDS stay zero (can_frame_t's
+    // designated initializer above zero-initializes data[]) -- correct for
+    // an oversize/truncated frame, where those bytes were never real data.
 
     // Callback is a good place to put any CAN ID or payload triggering function
     can_isr_callback_frame_rx(&frame, timestamp);
