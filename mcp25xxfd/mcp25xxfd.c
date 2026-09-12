@@ -473,6 +473,7 @@ uint32_t WEAK TIME_CRITICAL can_isr_callback_uref(can_uref_t uref)
 #define         C1TXQUA         (0x058U)
 #define         C1FIFOCON1      (0x05cU)
 #define             RXTSEN          (1U << 5)
+#define             RXOVIE          (1U << 3)
 #define             TFNRFNIE        (1U << 0)
 
 #define         C1FIFOSTA1      (0x060U)
@@ -483,7 +484,12 @@ uint32_t WEAK TIME_CRITICAL can_isr_callback_uref(can_uref_t uref)
 
 #define MCP25XXFD_TEFCON_CONFIG            (FSIZE(MCP25XXFD_HW_TEF_DEPTH - 1U) | TEFTSEN | TEFNEIE)
 #define MCP25XXFD_TXQCON_CONFIG            (PLSIZE(MCP25XXFD_HW_PAYLOAD_CODE) | FSIZE(MCP25XXFD_HW_TXQ_DEPTH - 1U) | TXAT(0x3U))
-#define MCP25XXFD_RXFIFOCON1_CONFIG        (PLSIZE(MCP25XXFD_HW_PAYLOAD_CODE) | FSIZE(MCP25XXFD_HW_RX_FIFO_DEPTH - 1U) | RXTSEN | TFNRFNIE)
+// RXOVIE enables the chip to actually latch/report RXOVIF (see C1INT bit 11
+// and push_rx_hw_overflow_event()) when this FIFO's own hardware buffer
+// overflows -- without it, that overflow was invisible to us entirely, not
+// just unhandled (verified: zero RXOVIF activity even while frames were
+// being lost during a burst, before this bit was added).
+#define MCP25XXFD_RXFIFOCON1_CONFIG        (PLSIZE(MCP25XXFD_HW_PAYLOAD_CODE) | FSIZE(MCP25XXFD_HW_RX_FIFO_DEPTH - 1U) | RXTSEN | RXOVIE | TFNRFNIE)
 
 // Hard reset of the MCP251xFD using a special SPI command
 static void TIME_CRITICAL hard_reset(can_interface_t *spi_interface)
@@ -1050,6 +1056,37 @@ static void TIME_CRITICAL error_handler(can_controller_t *controller)
     }
 }
 
+// Marks that the receive FIFO overflowed at the hardware level (the
+// MCP25xxFD's own onboard message RAM -- see RXOVIF, C1INT bit 11), as
+// distinct from this driver's own software-side rx_fifo queue (which
+// already had its own overflow tracking below in error_handler()/
+// rx_handler()). The chip doesn't report how many frames were actually
+// dropped, just that at least one was, so frame_cnt is incremented by 1 per
+// detected occurrence -- a lower bound, not an exact count.
+static void TIME_CRITICAL push_rx_hw_overflow_event(can_controller_t *controller, uint32_t timestamp)
+{
+    if (controller->rx_fifo.free <= 1U) {
+        if (controller->rx_fifo.free == 0) {
+            // There must already be an overflow event at the back of the queue.
+            controller->rx_fifo.rx_events[controller->rx_fifo.dropped_event_idx].event.overflow.frame_cnt++;
+            return;
+        }
+        controller->rx_fifo.free = 0;
+    } else {
+        controller->rx_fifo.free--;
+    }
+
+    uint8_t idx = controller->rx_fifo.tail_idx++;
+    controller->rx_fifo.dropped_event_idx = idx;
+    if (controller->rx_fifo.tail_idx == CAN_RX_FIFO_SIZE) {
+        controller->rx_fifo.tail_idx = 0;
+    }
+    controller->rx_fifo.rx_events[idx].event_type = CAN_EVENT_TYPE_OVERFLOW;
+    controller->rx_fifo.rx_events[idx].event.overflow.frame_cnt = 1U;
+    controller->rx_fifo.rx_events[idx].event.overflow.error_cnt = 0;
+    controller->rx_fifo.rx_events[idx].timestamp = timestamp;
+}
+
 // Called with a received frame
 // TODO performance enhancement: calculate addr by shadowing RX FIFO rather than use an SPI transaction to pick it up
 static void TIME_CRITICAL rx_handler(can_controller_t *controller)
@@ -1382,6 +1419,10 @@ void TIME_CRITICAL mcp25xxfd_irq_handler(can_controller_t *controller)
         if (events & TEFIF) {               // TEFIF (i.e. TEF event)
             // Dismissal of this event is implicit by emptying the transmit FIFO
             tx_handler(controller);
+        }
+        if (events & RXOVIF) {              // RXOVIF: the chip's own onboard RX FIFO overflowed
+            dismiss |= RXOVIF;
+            push_rx_hw_overflow_event(controller, read_word_crc(spi_interface, C1TBC));
         }
         if (events & RXIF) {                // RXIF (i.e. received frame into the FIFO)
             // Dismissal of this event is implicit by emptying the receive FIFO
