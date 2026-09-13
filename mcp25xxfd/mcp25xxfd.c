@@ -1452,6 +1452,21 @@ void TIME_CRITICAL mcp25xxfd_irq_handler(can_controller_t *controller)
         if (events & RXOVIF) {              // RXOVIF: the chip's own onboard RX FIFO overflowed
             dismiss |= RXOVIF;
             push_rx_hw_overflow_event(controller, read_word_crc(spi_interface, C1TBC));
+            // C1INT.RXOVIF is a summary of this FIFO's own C1FIFOSTA1.RXOVIF
+            // status bit, which the datasheet requires the application to
+            // clear explicitly -- this driver defined C1FIFOSTA1 (0x060) but
+            // never actually read or wrote it. Without clearing it, the
+            // summary bit re-asserts on every subsequent poll, misreporting
+            // every later received frame as a fresh overflow indefinitely,
+            // recoverable only by a full re-init (can_setup_controller() or
+            // a reboot) -- not a one-time spike that settles on its own.
+            // Confirmed directly (can-test-rig, midi-can-monitor issue #24):
+            // deliberately overflowing the chip's onboard RX FIFO (by
+            // disabling interrupts for the duration of a burst, mirroring
+            // what a flash_range_program()/flash_range_erase() call does)
+            // left every subsequent frame permanently flagged as an overflow
+            // with no self-recovery, until this line was added.
+            write_word(spi_interface, C1FIFOSTA1, 0);
         }
         if (events & RXIF) {                // RXIF (i.e. received frame into the FIFO)
             // Dismissal of this event is implicit by emptying the receive FIFO
