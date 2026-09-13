@@ -96,14 +96,36 @@ void debug_printf( const char *format, ... );
 // Number of bytes used to store a transmission event (CAN frame sent, etc.)
 #define NUM_TX_EVENT_BYTES                  (9U)
 // MCP25xxFD message RAM is 2 KB total. This bus's actual traffic (MIDI-over-
-// CAN) never exceeds 12 bytes per frame, so message objects are sized to
-// that instead of the CAN-FD default of 64 bytes -- this both reclaims
-// wasted chip RAM and roughly quadruples the RX FIFO depth (22 -> 80),
-// which is the real defense against dropped frames while the CPU is
-// briefly busy (e.g. a flash write -- see issue #19).
+// CAN) never exceeds 12 bytes per frame, so message objects don't need the
+// CAN-FD default of 64 bytes -- freeing RAM for a deeper RX FIFO, the real
+// defense against dropped frames while the CPU is briefly busy (e.g. a
+// flash write -- see issue #19).
 //
 // PLSIZE encoding (MCP25xxFD datasheet): 0=8, 1=12, 2=16, 3=20, 4=24, 5=32,
 // 6=48, 7=64 bytes.
+//
+// IMPORTANT: FSIZE (the depth field written into C1TEFCON/C1TXQCON/
+// C1FIFOCONm, used for all three of TEF/TXQ/RX FIFO depth below) is a
+// 5-bit hardware field (see FSIZE() below) -- valid encoded values 0-31,
+// so depth is hard-capped at 32 regardless of the RAM budget. A prior
+// version of this file set MCP25XXFD_HW_RX_FIFO_DEPTH=80 intending to
+// quadruple the RX FIFO depth (22 -> 80); FSIZE(79) computes
+// 79 & 0x1F = 15, silently configuring an actual depth of 16 instead --
+// worse than the original 22, not 4x better. The MCP25XXFD_RAM_USAGE_BYTES
+// check below catches an over-budget *byte* allocation, but nothing
+// caught this: an 80-slot request fit the RAM budget arithmetic fine at
+// 12-byte objects (1920 of 2048 bytes) despite being unrepresentable in
+// the actual 5-bit field. Confirmed by direct hardware measurement (real
+// depth ~16, not 80) in can-test-rig -- see
+// https://github.com/smeredith/canis-can-sdk/issues/1. The #error checks
+// below on all three FSIZE-fed depths exist so this can't recur silently.
+//
+// Since depth is hard-capped at 32 regardless of payload size (as long as
+// it fits the RAM budget), the effective choice is "how big can each
+// object be at depth 32", not "how deep can the FIFO be at some fixed
+// object size": 32-byte payload objects fit depth 32 with room to spare
+// (1616 of 2048 bytes) -- deeper *and* roomier per frame than either the
+// original 64-byte/22-slot config or the broken "80"-slot one.
 //
 // A node ever sending a frame bigger than this doesn't overflow anything --
 // the chip just truncates it on-chip and DLC still reports the sender's
@@ -114,9 +136,9 @@ void debug_printf( const char *format, ... );
 #define MCP25XXFD_RAM_BYTES                 (2048U)
 #define MCP25XXFD_HW_TEF_DEPTH              (4U)
 #define MCP25XXFD_HW_TXQ_DEPTH              (4U)
-#define MCP25XXFD_HW_RX_FIFO_DEPTH          (80U)
-#define MCP25XXFD_HW_PAYLOAD_CODE           (0x1U)       // 12-byte payload objects
-#define MCP25XXFD_HW_PAYLOAD_BYTES          (12U)
+#define MCP25XXFD_HW_RX_FIFO_DEPTH          (32U)
+#define MCP25XXFD_HW_PAYLOAD_CODE           (0x5U)       // 32-byte payload objects
+#define MCP25XXFD_HW_PAYLOAD_BYTES          (32U)
 #define MCP25XXFD_HW_PAYLOAD_WORDS          (MCP25XXFD_HW_PAYLOAD_BYTES / 4U)
 #define MCP25XXFD_TEF_OBJ_BYTES             (12U)        // TEF timestamp enabled
 #define MCP25XXFD_TXQ_OBJ_BYTES             (8U + MCP25XXFD_HW_PAYLOAD_BYTES)
@@ -128,6 +150,20 @@ void debug_printf( const char *format, ... );
 
 #if (MCP25XXFD_RAM_USAGE_BYTES > MCP25XXFD_RAM_BYTES)
 #error "MCP25xxFD message RAM allocation exceeds 2 KB"
+#endif
+
+// FSIZE (see its #define below) is a 5-bit field: max encodable depth is
+// 32. See the top-of-file comment above for the full story -- this is
+// what should have caught MCP25XXFD_HW_RX_FIFO_DEPTH=80 silently
+// truncating to 16.
+#if (MCP25XXFD_HW_TEF_DEPTH > 32)
+#error "MCP25XXFD_HW_TEF_DEPTH exceeds FSIZE's 5-bit field (max 32)"
+#endif
+#if (MCP25XXFD_HW_TXQ_DEPTH > 32)
+#error "MCP25XXFD_HW_TXQ_DEPTH exceeds FSIZE's 5-bit field (max 32)"
+#endif
+#if (MCP25XXFD_HW_RX_FIFO_DEPTH > 32)
+#error "MCP25XXFD_HW_RX_FIFO_DEPTH exceeds FSIZE's 5-bit field (max 32)"
 #endif
 
 #if (CAN_TX_QUEUE_SIZE < MCP25XXFD_HW_TXQ_DEPTH)
